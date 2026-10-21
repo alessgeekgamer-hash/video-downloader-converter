@@ -23,6 +23,24 @@ class IosEngine implements DownloadService {
       'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 '
       '(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
+  /// UA del cliente InnerTube que entregó el stream — googlevideo exige
+  /// el UA del cliente, si no responde HTTP403.
+  static String _uaForClient(String? client) {
+    switch (client) {
+      case 'IOS':
+        return 'com.google.ios.youtube/20.10.38 (iPhone16,2; U; CPU iOS 18_3 like Mac OS X)';
+      case 'ANDROID':
+        return 'com.google.android.youtube/20.10.38 (Linux; U; Android 14; en_US) gzip';
+      case 'MWEB':
+        return 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 '
+            '(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+      case 'TVHTML5_SIMPLY_EMBEDDED_PLAYER':
+        return 'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version';
+      default:
+        return ua;
+    }
+  }
+
   final _controller = StreamController<EngineEvent>.broadcast();
   final Map<String, HttpClient> _clients = {};
   final Map<String, bool> _canceled = {};
@@ -185,9 +203,13 @@ class IosEngine implements DownloadService {
       bool audioOnly, int maxHeight) async {
     final data = await extractFromPage(controller);
     final kind = (data['kind'] as String?) ?? 'none';
+    final clientUa = _uaForClient((data['client'] as String?) ?? 'WEB');
+    final ytHeaders = {
+      'User-Agent': clientUa,
+      'Referer': 'https://www.youtube.com/',
+    };
 
     if (kind == 'youtube-hls') {
-      // YouTube vía HLS: calidad completa con audio (y MP3 si se pide).
       final media = (data['media'] as String?) ?? '';
       if (media.isEmpty) {
         _emit(EngineEvent(
@@ -199,7 +221,7 @@ class IosEngine implements DownloadService {
       await _downloadHls(id, media,
           title: data['title'] as String?,
           audioOnly: audioOnly,
-          headers: const {'Referer': 'https://www.youtube.com/'});
+          headers: ytHeaders);
       return;
     }
 
@@ -219,34 +241,50 @@ class IosEngine implements DownloadService {
         final a = Map<String, dynamic>.from(audioList.first as Map);
         final url = a['url'] as String;
         _emit(EngineEvent(id: id, type: 'progress', progress: 0));
-        await _downloadDirect(id, url, audioOnly: true, title: data['title'] as String?,
-            extraHeaders: {
-              'User-Agent': ua,
-              'Referer': 'https://www.youtube.com/',
-            });
+        await _downloadDirect(id, url,
+            audioOnly: true, title: data['title'] as String?, extraHeaders: ytHeaders);
         return;
       }
-      final prog = (data['progressive'] as List? ?? const []);
-      if (prog.isEmpty) {
-        _emit(EngineEvent(
-            id: id,
-            type: 'error',
-            message: 'YouTube no ofreció audio para este video (${data['diag'] ?? ''})'));
-        return;
-      }
+      _emit(EngineEvent(
+          id: id,
+          type: 'error',
+          message:
+              'YouTube no ofrecio audio para este video (${data['diag'] ?? ''})'));
+      return;
     }
 
-    // Video: mejor mp4 progresivo (con audio) <= calidad elegida.
+    // Video: progresivo si existe; si no, unir adaptativos con ffmpeg.
     final prog = (data['progressive'] as List? ?? const [])
         .map((e) => Map<String, dynamic>.from(e as Map))
         .toList();
     if (prog.isEmpty) {
+      final av = (data['adaptiveVideo'] as List? ?? const [])
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
+      final audio = (data['audio'] as List? ?? const [])
+          .map((e) => Map<String, dynamic>.from(e as Map))
+          .toList();
+      Map<String, dynamic>? v;
+      for (final f in av) {
+        final h = (f['h'] as num?)?.toInt() ?? 0;
+        if (maxHeight <= 0 || h <= maxHeight || v == null) v = f;
+        if (maxHeight > 0 && h >= maxHeight) break;
+      }
+      if (v != null && audio.isNotEmpty) {
+        await _downloadAdaptiveMerge(
+          id: id,
+          videoUrl: v['url'] as String,
+          audioUrl: audio.first['url'] as String,
+          title: data['title'] as String?,
+          clientUa: clientUa,
+        );
+        return;
+      }
       _emit(EngineEvent(
           id: id,
           type: 'error',
-          message: audioOnly
-              ? 'Sin audio disponible (${data['diag'] ?? ''})'
-              : 'Este video solo ofrece formatos separados en iOS (elige MP3 o prueba otro video). ${data['diag'] ?? ''}'));
+          message:
+              'Este video solo ofrece formatos separados en iOS (elige MP3 o prueba otro video). ${data['diag'] ?? ''}'));
       return;
     }
     Map<String, dynamic>? chosen;
@@ -260,10 +298,7 @@ class IosEngine implements DownloadService {
     _emit(EngineEvent(
         id: id, type: 'progress', progress: 0, message: 'YouTube ${h}p'));
     await _downloadDirect(id, url,
-        audioOnly: audioOnly, title: data['title'] as String?, extraHeaders: {
-      'User-Agent': ua,
-      'Referer': 'https://www.youtube.com/',
-    });
+        audioOnly: audioOnly, title: data['title'] as String?, extraHeaders: ytHeaders);
   }
 
   /// Extrae TODO lo posible de la página cargada (YouTube u otro sitio).
@@ -331,6 +366,7 @@ class IosEngine implements DownloadService {
         try {
           final mapped =
               _mapPlayerJson(jsonDecode(raw) as Map<String, dynamic>);
+          mapped['client'] = name;
           if (mapped['kind'] != 'none') {
             data = {...data, ...mapped};
             data['diag'] = '${data['diag'] ?? ''}|it:$name';
@@ -392,6 +428,8 @@ class IosEngine implements DownloadService {
       'media': '',
       'progressive': [],
       'audio': [],
+      'adaptiveVideo': [],
+      'client': '',
       'diag': '',
     };
     final status = (p['playabilityStatus'] as Map<String, dynamic>?);
@@ -435,6 +473,18 @@ class IosEngine implements DownloadService {
           .toList()
         ..sort((a, b) => (b['br']! as int).compareTo(a['br']! as int));
       final adaptCount = ((sd['adaptiveFormats'] as List?) ?? const []).length;
+      final av = ((sd['adaptiveFormats'] as List?) ?? const [])
+          .where((f) =>
+              f is Map &&
+              f['url'] != null &&
+              (f['mimeType'] as String? ?? '').startsWith('video/'))
+          .map((f) => {
+                'url': f['url'],
+                'h': (f['height'] as num?)?.toInt() ?? 0,
+              })
+          .toList()
+        ..sort((a, b) => (b['h']! as int).compareTo(a['h']! as int));
+      out['adaptiveVideo'] = av;
 
       if (hls != null && hls.isNotEmpty) {
         out['media'] = hls;
@@ -554,6 +604,10 @@ class IosEngine implements DownloadService {
       const aud = (p.streamingData.adaptiveFormats || []).filter(x => x.url && x.mimeType && x.mimeType.indexOf("audio/") === 0);
       aud.sort((a,b) => (b.bitrate||0) - (a.bitrate||0));
       out.audio = aud.map(x => ({url:x.url, h:0, br:x.bitrate||0}));
+      const av = (p.streamingData.adaptiveFormats || []).filter(x => x.url && x.mimeType && x.mimeType.indexOf("video/") === 0);
+      av.sort((a,b) => (b.height||0) - (a.height||0));
+      out.adaptiveVideo = av.map(x => ({url:x.url, h:x.height||0}));
+      out.client = "WEB";
       // iPhone: YouTube sirve HLS (calidad completa con audio) via hlsManifestUrl.
       if (p.streamingData.hlsManifestUrl) {
         out.media = p.streamingData.hlsManifestUrl;
@@ -707,6 +761,8 @@ class IosEngine implements DownloadService {
         'kind': kind,
         'progressive': prog,
         'audio': audio,
+        'adaptiveVideo': (d['adaptiveVideo'] as List? ?? const []),
+        'client': (d['client'] as String?) ?? 'WEB',
         'page_url': 'https://www.youtube.com/',
       };
     }
@@ -730,7 +786,7 @@ class IosEngine implements DownloadService {
     };
   }
 
-  /// Descarga usando lo analizado en la página (Universal iOS).
+  /// Descarga usando lo analizado en la pagina (Universal iOS).
   Future<void> downloadFromAnalyzed({
     required String id,
     required Map<String, dynamic> info,
@@ -743,6 +799,7 @@ class IosEngine implements DownloadService {
       final kind = (info['kind'] as String?) ?? 'video';
       final title = info['title'] as String?;
       final page = (info['page_url'] as String?) ?? '';
+      final clientUa = _uaForClient((info['client'] as String?) ?? 'WEB');
 
       if (audioOnly) {
         final audio = (info['audio'] as List? ?? const []);
@@ -751,18 +808,17 @@ class IosEngine implements DownloadService {
         if (audio.isNotEmpty) url = audio.first['url'] as String;
         if (url == null && prog.isNotEmpty) url = prog.first['url'] as String;
         if (url == null) {
-          throw Exception('Este video no ofreció audio en iOS');
+          throw Exception('Este video no ofrecio audio en iOS');
         }
         await _downloadDirect(id, url, audioOnly: true, title: title,
             extraHeaders: {
-              'User-Agent': ua,
+              'User-Agent': clientUa,
               'Referer': page.isEmpty ? 'https://www.youtube.com/' : page,
             });
         return;
       }
 
       if (kind == 'youtube-hls') {
-        // YouTube para iPhone: manifiest HLS con video+audio (hasta 1080p).
         final media = (info['webpage_url'] as String?) ?? '';
         if (media.isEmpty) throw Exception('Sin manifiest HLS de YouTube');
         _emit(EngineEvent(
@@ -770,7 +826,10 @@ class IosEngine implements DownloadService {
         await _downloadHls(id, media,
             title: title,
             audioOnly: audioOnly,
-            headers: const {'Referer': 'https://www.youtube.com/'});
+            headers: {
+              'User-Agent': clientUa,
+              'Referer': 'https://www.youtube.com/',
+            });
         return;
       }
 
@@ -779,6 +838,29 @@ class IosEngine implements DownloadService {
             .map((e) => Map<String, dynamic>.from(e as Map))
             .toList();
         if (prog.isEmpty) {
+          // Sin progresivo: unir video+audio adaptativos con ffmpeg.
+          final av = (info['adaptiveVideo'] as List? ?? const [])
+              .map((e) => Map<String, dynamic>.from(e as Map))
+              .toList();
+          final audio = (info['audio'] as List? ?? const [])
+              .map((e) => Map<String, dynamic>.from(e as Map))
+              .toList();
+          Map<String, dynamic>? v;
+          for (final f in av) {
+            final h = (f['h'] as num?)?.toInt() ?? 0;
+            if (maxHeight <= 0 || h <= maxHeight || v == null) v = f;
+            if (maxHeight > 0 && h >= maxHeight) break;
+          }
+          if (v != null && audio.isNotEmpty) {
+            await _downloadAdaptiveMerge(
+              id: id,
+              videoUrl: v['url'] as String,
+              audioUrl: audio.first['url'] as String,
+              title: title,
+              clientUa: clientUa,
+            );
+            return;
+          }
           throw Exception(
               'Este video solo ofrece formatos separados en iOS (elige MP3)');
         }
@@ -793,7 +875,7 @@ class IosEngine implements DownloadService {
             id: id, type: 'progress', progress: 0, message: 'YouTube ${h}p'));
         await _downloadDirect(id, chosen['url'] as String,
             title: title, extraHeaders: {
-              'User-Agent': ua,
+              'User-Agent': clientUa,
               'Referer': 'https://www.youtube.com/',
             });
         return;
@@ -803,13 +885,122 @@ class IosEngine implements DownloadService {
       if (media.isEmpty) throw Exception('Sin URL de media');
       if (kind == 'hls' || media.contains('.m3u8')) {
         await _downloadHls(id, media,
-            title: title,
-            headers: {'User-Agent': ua, 'Referer': page});
+            title: title, headers: {'User-Agent': clientUa, 'Referer': page});
       } else {
-        await _downloadDirect(id, media, title: title,
-            headers: {'User-Agent': ua, 'Referer': page});
+        await _downloadDirect(id, media,
+            title: title, headers: {'User-Agent': clientUa, 'Referer': page});
       }
     });
+  }
+
+  /// Descarga video y audio (adaptativos por separado) y los une con
+  /// ffmpeg-kit en un solo MP4 con audio.
+  Future<void> _downloadAdaptiveMerge({
+    required String id,
+    required String videoUrl,
+    required String audioUrl,
+    required String? title,
+    required String clientUa,
+  }) async {
+    final dir = await downloadDir();
+    final work = Directory('${dir.path}/$id.adapt');
+    if (work.existsSync()) work.deleteSync(recursive: true);
+    work.createSync(recursive: true);
+    final vFile = File('${work.path}/video.mp4');
+    final aFile = File('${work.path}/audio.m4a');
+    final ytHeaders = {
+      'User-Agent': clientUa,
+      'Referer': 'https://www.youtube.com/',
+    };
+
+    _emit(EngineEvent(
+        id: id, type: 'progress', progress: 0, message: 'Video...'));
+    await _downloadToFile(id, videoUrl, vFile,
+        headers: ytHeaders, progressFrom: 0, progressTo: 85);
+    if (_canceled[id] == true) return;
+    _emit(EngineEvent(
+        id: id, type: 'progress', progress: 86, message: 'Audio...'));
+    await _downloadToFile(id, audioUrl, aFile,
+        headers: ytHeaders, progressFrom: 87, progressTo: 98);
+    if (_canceled[id] == true) return;
+
+    final safe = (title ?? 'video').replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+    final joined = '${work.path}/$safe.mp4';
+    _emit(EngineEvent(
+        id: id, type: 'progress', progress: 99, message: 'Uniendo pistas'));
+    final session = await FFmpegKit.execute(
+        '-y -i "${vFile.path}" -i "${aFile.path}" -c copy "$joined"');
+    final rc = await session.getReturnCode();
+    if (rc == null || !ReturnCode.isSuccess(rc)) {
+      throw Exception('FFmpeg no pudo unir video y audio (${rc?.getValue()})');
+    }
+    final outPath = '${dir.path}/$safe.mp4';
+    final out = File(outPath);
+    if (out.existsSync()) out.deleteSync();
+    File(joined).renameSync(outPath);
+    try {
+      work.deleteSync(recursive: true);
+    } catch (_) {}
+    _emit(EngineEvent(id: id, type: 'done', progress: 100, path: outPath));
+  }
+
+  /// Descarga un archivo a destino concreto con progreso escalado.
+  Future<void> _downloadToFile(
+    String id,
+    String url,
+    File target, {
+    Map<String, String>? headers,
+    double progressFrom = 0,
+    double progressTo = 100,
+  }) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 30);
+    _clients[id] = client;
+    final req = await client.getUrl(Uri.parse(url));
+    req.headers.set('User-Agent', ua);
+    headers?.forEach((k, v) => req.headers.set(k, v));
+    final resp = await req.close();
+    if (resp.statusCode >= 400) {
+      client.close(force: true);
+      throw Exception('El servidor respondio HTTP ${resp.statusCode}');
+    }
+    final total = resp.contentLength;
+    var received = 0;
+    var lastPct = -1.0;
+    final sink = target.openWrite();
+    final completer = Completer<void>();
+    resp.listen(
+      (chunk) {
+        if (_canceled[id] == true) {
+          sink.close();
+          if (!completer.isCompleted) completer.completeError('cancel');
+          return;
+        }
+        received += chunk.length;
+        sink.add(chunk);
+        if (total > 0) {
+          final frac = received * 100 / total;
+          final pct = progressFrom + (progressTo - progressFrom) * frac / 100;
+          final rounded = pct.floorToDouble();
+          if (rounded != lastPct) {
+            lastPct = rounded;
+            _emit(EngineEvent(id: id, type: 'progress', progress: rounded));
+          }
+        }
+      },
+      onDone: () async {
+        await sink.close();
+        if (!completer.isCompleted) completer.complete();
+      },
+      onError: (e) async {
+        await sink.close();
+        if (!completer.isCompleted) completer.completeError(e);
+      },
+      cancelOnError: true,
+    );
+    await completer.future;
+    _clients.remove(id);
+    if (_canceled[id] == true) throw Exception('Cancelado');
   }
 
   /// Descarga desde la pestaña Universal (media ya analizado).
@@ -860,9 +1051,7 @@ class IosEngine implements DownloadService {
 
     final req = await client.getUrl(Uri.parse(url));
     req.headers.set('User-Agent', ua);
-    (headers ?? extraHeaders ?? const {}).forEach((k, v) {
-      if (k.toLowerCase() != 'user-agent') req.headers.set(k, v);
-    });
+    (headers ?? extraHeaders ?? const {}).forEach((k, v) { req.headers.set(k, v); });
     if (extraHeaders != null) {
       extraHeaders.forEach((k, v) => req.headers.set(k, v));
     }
@@ -1063,9 +1252,7 @@ class IosEngine implements DownloadService {
     try {
       final req = await client.getUrl(Uri.parse(url));
       req.headers.set('User-Agent', ua);
-      headers?.forEach((k, v) {
-        if (k.toLowerCase() != 'user-agent') req.headers.set(k, v);
-      });
+      headers?.forEach((k, v) { req.headers.set(k, v); });
       final resp = await req.close();
       await resp.pipe(file.openWrite());
     } finally {
@@ -1078,9 +1265,7 @@ class IosEngine implements DownloadService {
     try {
       final req = await client.getUrl(Uri.parse(url));
       req.headers.set('User-Agent', ua);
-      headers?.forEach((k, v) {
-        if (k.toLowerCase() != 'user-agent') req.headers.set(k, v);
-      });
+      headers?.forEach((k, v) { req.headers.set(k, v); });
       final resp = await req.close();
       return await resp.transform(utf8.decoder).join();
     } finally {
