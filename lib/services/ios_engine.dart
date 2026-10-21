@@ -267,23 +267,57 @@ class IosEngine implements DownloadService {
   }
 
   /// Extrae TODO lo posible de la página cargada (YouTube u otro sitio).
-  /// Devuelve: kind (youtube | hls | video | none), title, thumbnail,
-  /// duration, progressive[], audio[], media, diag.
+  /// Devuelve: kind (youtube | youtube-hls | youtube-audio | hls | video |
+  /// none), title, thumbnail, duration, progressive[], audio[], media, diag.
   Future<Map<String, dynamic>> extractFromPage(
       InAppWebViewController controller) async {
-    final raw = await controller.evaluateJavascript(source: _extractJs);
-    Map<String, dynamic> data;
-    try {
-      data = jsonDecode(raw is String ? raw : jsonEncode(raw))
-          as Map<String, dynamic>;
-    } catch (_) {
-      return {
-        'kind': 'none',
-        'diag': 'js-invalido',
-        'progressive': <Map<String, dynamic>>[],
-        'audio': <Map<String, dynamic>>[],
-      };
+    // Fase1: fuentes embebidas en la página.
+    var data = _decodeJsMap(
+        await controller.evaluateJavascript(source: _extractJs));
+
+    // Fase2: InnerTube (cliente ANDROID) desde la propia página.
+    // Devuelve URLs directas aunque la respuesta web venga cifrada.
+    if (data['kind'] == 'none') {
+      await controller.evaluateJavascript(source: _innertubeStartJs);
+      String? raw;
+      for (var i = 0; i < 20; i++) {
+        await Future.delayed(const Duration(seconds: 1));
+        final poll = _decodeJsMap(
+            await controller.evaluateJavascript(source: _pollJs));
+        if (poll['p'] == false) {
+          raw = poll['d'] as String?;
+          final err = poll['e'] as String?;
+          data['diag'] = '${data['diag'] ?? ''}|it-err:${err ?? ''}';
+          break;
+        }
+      }
+      if (raw != null && raw.isNotEmpty) {
+        try {
+          final mapped =
+              _mapPlayerJson(jsonDecode(raw) as Map<String, dynamic>);
+          data = {...data, ...mapped};
+          data['diag'] = '${data['diag'] ?? ''}|inner-tube';
+        } catch (e) {
+          data['diag'] = '${data['diag'] ?? ''}|it-parse';
+        }
+      }
     }
+
+    // Fase3: reproducir en silencio y leer currentSrc del <video>.
+    if (data['kind'] == 'none') {
+      try {
+        await controller.evaluateJavascript(source: _autoplayJs);
+        await Future.delayed(const Duration(seconds: 4));
+        final src = await controller.evaluateJavascript(source: _readSrcJs);
+        final s = (src is String) ? src.trim() : '';
+        if (s.startsWith('http')) {
+          data['media'] = s;
+          data['kind'] = s.contains('.m3u8') ? 'hls' : 'video';
+          data['diag'] = '${data['diag'] ?? ''}|autoplay-src';
+        }
+      } catch (_) {}
+    }
+
     // Normalizar listas.
     data['progressive'] = ((data['progressive'] as List?) ?? const [])
         .map((e) => Map<String, dynamic>.from(e as Map))
@@ -293,6 +327,134 @@ class IosEngine implements DownloadService {
         .toList();
     return data;
   }
+
+  Map<String, dynamic> _decodeJsMap(dynamic raw) {
+    try {
+      return jsonDecode(raw is String ? raw : jsonEncode(raw))
+          as Map<String, dynamic>;
+    } catch (_) {
+      return {
+        'kind': 'none',
+        'diag': 'js-invalido',
+        'progressive': <Map<String, dynamic>>[],
+        'audio': <Map<String, dynamic>>[],
+      };
+    }
+  }
+
+  /// Convierte la respuesta de InnerTube al mismo formato de extractFromPage.
+  Map<String, dynamic> _mapPlayerJson(Map<String, dynamic> p) {
+    final out = <String, dynamic>{
+      'kind': 'none',
+      'title': '',
+      'thumbnail': '',
+      'duration': 0,
+      'media': '',
+      'progressive': [],
+      'audio': [],
+      'diag': '',
+    };
+    final status = (p['playabilityStatus'] as Map<String, dynamic>?);
+    final statusReason = (status?['reason'] as String?) ?? '';
+    if (statusReason.isNotEmpty) out['diag'] = 'estado:$statusReason';
+
+    final vd = p['videoDetails'] as Map<String, dynamic>?;
+    out['title'] = (vd?['title'] as String?) ?? '';
+    out['duration'] = int.tryParse((vd?['lengthSeconds'] as String?) ?? '') ?? 0;
+    try {
+      final th = (vd?['thumbnail']?['thumbnails'] as List?) ?? const [];
+      if (th.isNotEmpty) out['thumbnail'] = th.last['url'];
+    } catch (_) {}
+
+    final sd = p['streamingData'] as Map<String, dynamic>?;
+    if (sd != null) {
+      final hls = sd['hlsManifestUrl'] as String?;
+      final prog = ((sd['formats'] as List?) ?? const [])
+          .where((f) => f is Map && f['url'] != null)
+          .map((f) => {
+                'url': f['url'],
+                'h': (f['height'] as num?)?.toInt() ?? 0,
+              })
+          .toList()
+        ..sort((a, b) => (b['h']! as int).compareTo(a['h']! as int));
+      final aud = ((sd['adaptiveFormats'] as List?) ?? const [])
+          .where((f) =>
+              f is Map &&
+              f['url'] != null &&
+              (f['mimeType'] as String? ?? '').startsWith('audio/'))
+          .map((f) => {
+                'url': f['url'],
+                'h': 0,
+                'br': (f['bitrate'] as num?)?.toInt() ?? 0,
+              })
+          .toList()
+        ..sort((a, b) => (b['br']! as int).compareTo(a['br']! as int));
+      final adaptCount = ((sd['adaptiveFormats'] as List?) ?? const []).length;
+
+      if (hls != null && hls.isNotEmpty) {
+        out['media'] = hls;
+        out['kind'] = 'youtube-hls';
+      } else if (prog.isNotEmpty) {
+        out['progressive'] = prog;
+        out['kind'] = 'youtube';
+      } else if (aud.isNotEmpty) {
+        out['audio'] = aud;
+        out['kind'] = 'youtube-audio';
+      } else {
+        out['diag'] = '${out['diag'] ?? ''}|adaptativos:$adaptCount|claves:'
+            '${sd.keys.join(",")}';
+      }
+    } else {
+      out['diag'] = '${out['diag'] ?? ''}|sin-streamingData';
+    }
+    return out;
+  }
+
+  /// Fase2: dispara la petición InnerTube (cliente ANDROID) en la página.
+  static const _pollJs =
+      r'(()=>({p: !!window.__vdcPending, d: window.__vdcResult || null, e: window.__vdcErr || null}))()';
+
+  static const _innertubeStartJs = r'''
+(() => {
+  window.__vdcPending = true; window.__vdcResult = null; window.__vdcErr = null;
+  try {
+    let vid = "";
+    const m = location.search.match(/v=([A-Za-z0-9_-]{6,})/);
+    if (m) vid = m[1];
+    if (!vid && location.pathname.indexOf("/shorts/") === 0) vid = location.pathname.split("/")[2] || "";
+    if (!vid && window.ytInitialPlayerResponse && ytInitialPlayerResponse.videoDetails) vid = ytInitialPlayerResponse.videoDetails.videoId || "";
+    if (!vid) { window.__vdcErr = "sin-video-id"; window.__vdcPending = false; return "x"; }
+    let key = "";
+    try { if (window.ytcfg && typeof ytcfg.get === "function") key = ytcfg.get("INNERTUBE_API_KEY") || ""; } catch(e){}
+    const body = {
+      videoId: vid, contentCheckOk: true, racyCheckOk: true,
+      context: {client: {clientName: "ANDROID", clientVersion: "19.09.37", androidSdkVersion: 34, hl: "es", gl: "MX"}}
+    };
+    fetch("/youtubei/v1/player" + (key ? ("?key=" + key) : "") + "?prettyPrint=false", {
+      method: "POST", credentials: "include",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify(body)
+    })
+      .then(r => r.json())
+      .then(j => { window.__vdcResult = JSON.stringify(j); window.__vdcPending = false; })
+      .catch(e => { window.__vdcErr = String(e); window.__vdcPending = false; });
+    return "started";
+  } catch (e) { window.__vdcErr = String(e); window.__vdcPending = false; return "x"; }
+})()
+''';
+
+  static const _autoplayJs = r'''
+(() => {
+  const v = document.querySelector("video");
+  if (!v) return "novideo";
+  try { v.muted = true; v.defaultMuted = true; v.volume = 0; } catch(e){}
+  try { const pr = v.play(); if (pr && pr.catch) pr.catch(() => {}); } catch(e){}
+  return "ok";
+})()
+''';
+
+  static const _readSrcJs =
+      r'(()=>{const v=document.querySelector("video");return v ? (v.currentSrc || v.src || "") : "";})()';
 
   /// JS multi-fuente de extracción (YouTube + video/HLS embebido).
   /// IMPORTANTE: sin comillas simples (va dentro de un string raw de Dart).
