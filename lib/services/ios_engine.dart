@@ -364,9 +364,16 @@ class IosEngine implements DownloadService {
     var data = _decodeJsMap(
         await controller.evaluateJavascript(source: _extractJs));
 
-    // Fase2: InnerTube con VARIOS clientes (IOS primero: da HLS para iPhone).
-    // Funciona aunque la respuesta web venga cifrada.
-    if (data['kind'] == 'none') {
+    // YouTube: SIEMPRE pedir el player desde DART (misma IP de red que la
+    // descarga). Las URL embebidas de la pagina (WebKit) se descartan:
+    // estan atadas a OTRA IP y causan HTTP403 con ip=.
+    final videoId = (data['videoId'] as String?) ?? '';
+    final innertubeKey = (data['key'] as String?) ?? '';
+    if (videoId.isNotEmpty && data['kind'] != 'none') {
+      data['diag'] = '${data['diag'] ?? ''}|web-descartado:${data['kind']}';
+      data['kind'] = 'none';
+    }
+    if (videoId.isNotEmpty) {
       final clients = <Map<String, dynamic>>[
         {
           'clientName': 'IOS',
@@ -397,10 +404,7 @@ class IosEngine implements DownloadService {
         },
       ];
       // La peticion se hace DESDE DART (mismo stack de red que la
-      // descarga): el servidor ata la URL a la IP que la pidio, y si
-      // WebKit pide con IPv6 y Dart descarga con IPv6/IPv4 distinto ->403.
-      final videoId = (data['videoId'] as String?) ?? '';
-      final innertubeKey = (data['key'] as String?) ?? '';
+      // descarga): el servidor ata la URL a la IP que la pidio.
       if (videoId.isEmpty) {
         data['diag'] = '${data['diag'] ?? ''}|sin-video-id';
       }
