@@ -90,7 +90,7 @@ class _ExtractTabState extends State<ExtractTab>
         // (YouTube, TikTok y cualquier sitio con video embebido).
         _pendingAnalysis = true;
         _analysisTimer?.cancel();
-        _analysisTimer = Timer(const Duration(seconds: 35), () {
+        _analysisTimer = Timer(const Duration(seconds: 80), () {
           if (_pendingAnalysis && mounted) {
             _pendingAnalysis = false;
             setState(() {

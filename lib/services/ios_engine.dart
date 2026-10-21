@@ -275,30 +275,72 @@ class IosEngine implements DownloadService {
     var data = _decodeJsMap(
         await controller.evaluateJavascript(source: _extractJs));
 
-    // Fase2: InnerTube (cliente ANDROID) desde la propia página.
-    // Devuelve URLs directas aunque la respuesta web venga cifrada.
+    // Fase2: InnerTube con VARIOS clientes (IOS primero: da HLS para iPhone).
+    // Funciona aunque la respuesta web venga cifrada.
     if (data['kind'] == 'none') {
-      await controller.evaluateJavascript(source: _innertubeStartJs);
-      String? raw;
-      for (var i = 0; i < 20; i++) {
-        await Future.delayed(const Duration(seconds: 1));
-        final poll = _decodeJsMap(
-            await controller.evaluateJavascript(source: _pollJs));
-        if (poll['p'] == false) {
-          raw = poll['d'] as String?;
-          final err = poll['e'] as String?;
-          data['diag'] = '${data['diag'] ?? ''}|it-err:${err ?? ''}';
-          break;
+      final clients = <Map<String, dynamic>>[
+        {
+          'clientName': 'IOS',
+          'clientVersion': '20.10.38',
+          'deviceModel': 'iPhone16,2',
+          'hl': 'es',
+          'gl': 'MX',
+        },
+        {
+          'clientName': 'ANDROID',
+          'clientVersion': '20.10.38',
+          'androidSdkVersion': 34,
+          'hl': 'es',
+          'gl': 'MX',
+        },
+        {
+          'clientName': 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+          'clientVersion': '2.0',
+          'hl': 'es',
+          'gl': 'MX',
+          'thirdParty': {'embedUrl': 'https://www.google.com/'},
+        },
+        {
+          'clientName': 'MWEB',
+          'clientVersion': '2.20250401.01.00',
+          'hl': 'es',
+          'gl': 'MX',
+        },
+      ];
+      for (final cl in clients) {
+        if (!mounted) break;
+        final name = cl['clientName'] as String;
+        await controller.evaluateJavascript(
+            source: _innertubeJs(jsonEncode(cl)));
+        String? raw;
+        for (var i = 0; i < 12; i++) {
+          await Future.delayed(const Duration(seconds: 1));
+          final poll = _decodeJsMap(
+              await controller.evaluateJavascript(source: _pollJs));
+          if (poll['p'] == false) {
+            raw = poll['d'] as String?;
+            final err = poll['e'] as String?;
+            if (err != null && err.isNotEmpty) {
+              data['diag'] = '${data['diag'] ?? ''}|$name:$err';
+            }
+            break;
+          }
         }
-      }
-      if (raw != null && raw.isNotEmpty) {
+        if (raw == null || raw.isEmpty) {
+          data['diag'] = '${data['diag'] ?? ''}|$name:tiempo';
+          continue;
+        }
         try {
           final mapped =
               _mapPlayerJson(jsonDecode(raw) as Map<String, dynamic>);
-          data = {...data, ...mapped};
-          data['diag'] = '${data['diag'] ?? ''}|inner-tube';
-        } catch (e) {
-          data['diag'] = '${data['diag'] ?? ''}|it-parse';
+          if (mapped['kind'] != 'none') {
+            data = {...data, ...mapped};
+            data['diag'] = '${data['diag'] ?? ''}|it:$name';
+            break;
+          }
+          data['diag'] = '${data['diag'] ?? ''}|$name:{${mapped['diag'] ?? ''}}';
+        } catch (_) {
+          data['diag'] = '${data['diag'] ?? ''}|$name:parse';
         }
       }
     }
@@ -356,7 +398,12 @@ class IosEngine implements DownloadService {
     };
     final status = (p['playabilityStatus'] as Map<String, dynamic>?);
     final statusReason = (status?['reason'] as String?) ?? '';
-    if (statusReason.isNotEmpty) out['diag'] = 'estado:$statusReason';
+    out['diag'] = 'st:${status?['status'] ?? 's-st'}';
+    if (statusReason.isNotEmpty) out['diag'] += ' razon:$statusReason';
+    final errObj = p['error'] as Map<String, dynamic>?;
+    if (errObj != null) {
+      out['diag'] += ' error:${errObj['code']}:${errObj['message']}';
+    }
 
     final vd = p['videoDetails'] as Map<String, dynamic>?;
     out['title'] = (vd?['title'] as String?) ?? '';
@@ -405,7 +452,8 @@ class IosEngine implements DownloadService {
             '${sd.keys.join(",")}';
       }
     } else {
-      out['diag'] = '${out['diag'] ?? ''}|sin-streamingData';
+      out['diag'] = '${out['diag'] ?? ''}|sin-streamingData|keys:'
+          '${p.keys.take(10).join(",")}';
     }
     return out;
   }
@@ -414,7 +462,9 @@ class IosEngine implements DownloadService {
   static const _pollJs =
       r'(()=>({p: !!window.__vdcPending, d: window.__vdcResult || null, e: window.__vdcErr || null}))()';
 
-  static const _innertubeStartJs = r'''
+  /// JS que dispara InnerTube para el cliente dado (sin comillas simples).
+  static String _innertubeJs(Map<String, dynamic> client) {
+    return r'''
 (() => {
   window.__vdcPending = true; window.__vdcResult = null; window.__vdcErr = null;
   try {
@@ -428,7 +478,7 @@ class IosEngine implements DownloadService {
     try { if (window.ytcfg && typeof ytcfg.get === "function") key = ytcfg.get("INNERTUBE_API_KEY") || ""; } catch(e){}
     const body = {
       videoId: vid, contentCheckOk: true, racyCheckOk: true,
-      context: {client: {clientName: "ANDROID", clientVersion: "19.09.37", androidSdkVersion: 34, hl: "es", gl: "MX"}}
+      context: {client: __CLIENT_JSON__}
     };
     fetch("/youtubei/v1/player" + (key ? ("?key=" + key) : "") + "?prettyPrint=false", {
       method: "POST", credentials: "include",
@@ -441,7 +491,8 @@ class IosEngine implements DownloadService {
     return "started";
   } catch (e) { window.__vdcErr = String(e); window.__vdcPending = false; return "x"; }
 })()
-''';
+'''.replaceAll('__CLIENT_JSON__', jsonEncode(client));
+  }
 
   static const _autoplayJs = r'''
 (() => {
