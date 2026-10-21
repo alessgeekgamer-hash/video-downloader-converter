@@ -74,7 +74,7 @@ class IosEngine implements DownloadService {
     return h;
   }
 
-  /// Mensaje rico para errores HTTP (host, cliente, cookies).
+  /// Mensaje rico para errores HTTP (host, cliente, cookies, ip/expira).
   String _httpError(int code, String url) {
     String host;
     try {
@@ -83,8 +83,18 @@ class IosEngine implements DownloadService {
       host = '?';
     }
     final hasCookie = sessionCookies != null && sessionCookies!.isNotEmpty;
+    var extra = '';
+    if (url.contains('&ip=')) {
+      extra = ' | ip=si (atada a la IP que la pidio)';
+    }
+    final mExp = RegExp(r'expire=(\d+)').firstMatch(url);
+    if (mExp != null) {
+      final exp = int.tryParse(mExp.group(1)!) ?? 0;
+      final delta = exp - DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      extra += ' | vence en ${Duration(seconds: delta).inMinutes} min';
+    }
     return 'El servidor respondio HTTP $code (host: $host | cliente: '
-        '${_lastClient.isEmpty ? "?" : _lastClient} | cookies: ${hasCookie ? "si" : "NO"})';
+        '${_lastClient.isEmpty ? "?" : _lastClient} | cookies: ${hasCookie ? "si" : "NO"}$extra)';
   }
 
   final _controller = StreamController<EngineEvent>.broadcast();
@@ -386,40 +396,36 @@ class IosEngine implements DownloadService {
           'gl': 'MX',
         },
       ];
+      // La peticion se hace DESDE DART (mismo stack de red que la
+      // descarga): el servidor ata la URL a la IP que la pidio, y si
+      // WebKit pide con IPv6 y Dart descarga con IPv6/IPv4 distinto ->403.
+      final videoId = (data['videoId'] as String?) ?? '';
+      final innertubeKey = (data['key'] as String?) ?? '';
+      if (videoId.isEmpty) {
+        data['diag'] = '${data['diag'] ?? ''}|sin-video-id';
+      }
       for (final cl in clients) {
+        if (videoId.isEmpty) break;
         final name = cl['clientName'] as String;
-        await controller.evaluateJavascript(source: _innertubeJs(cl));
-        String? raw;
-        for (var i = 0; i < 12; i++) {
-          await Future.delayed(const Duration(seconds: 1));
-          final poll = _decodeJsMap(
-              await controller.evaluateJavascript(source: _pollJs));
-          if (poll['p'] == false) {
-            raw = poll['d'] as String?;
-            final err = poll['e'] as String?;
-            if (err != null && err.isNotEmpty) {
-              data['diag'] = '${data['diag'] ?? ''}|$name:$err';
-            }
-            break;
-          }
-        }
-        if (raw == null || raw.isEmpty) {
-          data['diag'] = '${data['diag'] ?? ''}|$name:tiempo';
+        final pj = await _playerViaDart(
+            videoId: videoId, key: innertubeKey, client: cl);
+        if (pj == null) {
+          data['diag'] = '${data['diag'] ?? ''}|$name:sin-respuesta';
           continue;
         }
-        try {
-          final mapped =
-              _mapPlayerJson(jsonDecode(raw) as Map<String, dynamic>);
-          mapped['client'] = name;
-          if (mapped['kind'] != 'none') {
-            data = {...data, ...mapped};
-            data['diag'] = '${data['diag'] ?? ''}|it:$name';
-            break;
-          }
-          data['diag'] = '${data['diag'] ?? ''}|$name:{${mapped['diag'] ?? ''}}';
-        } catch (_) {
-          data['diag'] = '${data['diag'] ?? ''}|$name:parse';
+        final errText = pj['__error'];
+        if (errText != null) {
+          data['diag'] = '${data['diag'] ?? ''}|$name:$errText';
+          continue;
         }
+        final mapped = _mapPlayerJson(pj);
+        mapped['client'] = name;
+        if (mapped['kind'] != 'none') {
+          data = {...data, ...mapped};
+          data['diag'] = '${data['diag'] ?? ''}|it:$name';
+          break;
+        }
+        data['diag'] = '${data['diag'] ?? ''}|$name:{${mapped['diag'] ?? ''}}';
       }
     }
 
@@ -550,40 +556,45 @@ class IosEngine implements DownloadService {
     return out;
   }
 
-  /// Fase2: dispara la petición InnerTube (cliente ANDROID) en la página.
-  static const _pollJs =
-      r'(()=>({p: !!window.__vdcPending, d: window.__vdcResult || null, e: window.__vdcErr || null}))()';
-
-  /// JS que dispara InnerTube para el cliente dado (sin comillas simples).
-  static String _innertubeJs(Map<String, dynamic> client) {
-    return r'''
-(() => {
-  window.__vdcPending = true; window.__vdcResult = null; window.__vdcErr = null;
-  try {
-    let vid = "";
-    const m = location.search.match(/v=([A-Za-z0-9_-]{6,})/);
-    if (m) vid = m[1];
-    if (!vid && location.pathname.indexOf("/shorts/") === 0) vid = location.pathname.split("/")[2] || "";
-    if (!vid && window.ytInitialPlayerResponse && ytInitialPlayerResponse.videoDetails) vid = ytInitialPlayerResponse.videoDetails.videoId || "";
-    if (!vid) { window.__vdcErr = "sin-video-id"; window.__vdcPending = false; return "x"; }
-    let key = "";
-    try { if (window.ytcfg && typeof ytcfg.get === "function") key = ytcfg.get("INNERTUBE_API_KEY") || ""; } catch(e){}
-    const body = {
-      videoId: vid, contentCheckOk: true, racyCheckOk: true,
-      context: {client: __CLIENT_JSON__}
-    };
-    fetch("/youtubei/v1/player" + (key ? ("?key=" + key) : "") + "?prettyPrint=false", {
-      method: "POST", credentials: "include",
-      headers: {"content-type": "application/json"},
-      body: JSON.stringify(body)
-    })
-      .then(r => r.json())
-      .then(j => { window.__vdcResult = JSON.stringify(j); window.__vdcPending = false; })
-      .catch(e => { window.__vdcErr = String(e); window.__vdcPending = false; });
-    return "started";
-  } catch (e) { window.__vdcErr = String(e); window.__vdcPending = false; return "x"; }
-})()
-'''.replaceAll('__CLIENT_JSON__', jsonEncode(client));
+  /// Peticion InnerTube hecha DESDE DART: mismo stack de red que la
+  /// descarga (misma IP/familia) - evita el403 por ip= embebido.
+  Future<Map<String, dynamic>?> _playerViaDart({
+    required String videoId,
+    required String key,
+    required Map<String, dynamic> client,
+  }) async {
+    final uri = Uri.parse('https://www.youtube.com/youtubei/v1/player'
+        '?prettyPrint=false${key.isEmpty ? '' : '&key=$key'}');
+    final body = jsonEncode({
+      'videoId': videoId,
+      'contentCheckOk': true,
+      'racyCheckOk': true,
+      'context': {'client': client},
+    });
+    final hc = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 20);
+    try {
+      final req = await hc.postUrl(uri);
+      req.headers.contentType =
+          ContentType('application', 'json', charset: 'utf-8');
+      req.headers.set('User-Agent', ua);
+      req.headers.set('Referer', 'https://www.youtube.com/');
+      final ck = sessionCookies;
+      if (ck != null && ck.isNotEmpty) req.headers.set('Cookie', ck);
+      req.write(body);
+      final resp = await req.close().timeout(const Duration(seconds: 25));
+      final text = await resp.transform(utf8.decoder).join();
+      if (resp.statusCode != 200) {
+        return {'__error': 'player HTTP ${resp.statusCode}'};
+      }
+      final j = jsonDecode(text);
+      if (j is Map<String, dynamic>) return j;
+      return {'__error': 'json-invalido'};
+    } catch (e) {
+      return {'__error': e.toString()};
+    } finally {
+      hc.close(force: true);
+    }
   }
 
   static const _autoplayJs = r'''
@@ -685,6 +696,17 @@ class IosEngine implements DownloadService {
       if (mt && mt.content && !out.title) out.title = mt.content;
     } catch(e){}
   }
+  try {
+    if (window.ytcfg && typeof ytcfg.get === "function") out.key = ytcfg.get("INNERTUBE_API_KEY") || "";
+  } catch(e){}
+  try {
+    let vid = "";
+    const m = location.search.match(/v=([A-Za-z0-9_-]{6,})/);
+    if (m) vid = m[1];
+    if (!vid && location.pathname.indexOf("/shorts/") === 0) vid = location.pathname.split("/")[2] || "";
+    if (!vid && window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.videoDetails) vid = window.ytInitialPlayerResponse.videoDetails.videoId || "";
+    out.videoId = vid;
+  } catch(e){}
   out.diag += "|url:" + location.href + "|ytipr:" + (typeof window.ytInitialPlayerResponse);
   return JSON.stringify(out);
 })()
