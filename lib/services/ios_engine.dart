@@ -66,12 +66,13 @@ class IosEngine implements DownloadService {
     } catch (_) {}
   }
 
+  // IMPORTANTE: googlevideo rechaza con cookies de sesion (403) para
+  // descargas anonimas; el player SII las lleva, la descarga NO.
   Map<String, String> _ytHeaders(String clientUa) {
-    final h = <String, String>{'User-Agent': clientUa};
-    h['Referer'] = 'https://www.youtube.com/';
-    final ck = sessionCookies;
-    if (ck != null && ck.isNotEmpty) h['Cookie'] = ck;
-    return h;
+    return {
+      'User-Agent': clientUa,
+      'Referer': 'https://www.youtube.com/',
+    };
   }
 
   /// Mensaje rico para errores HTTP (host, cliente, cookies, ip/expira).
@@ -1003,6 +1004,30 @@ class IosEngine implements DownloadService {
     _emit(EngineEvent(id: id, type: 'done', progress: 100, path: outPath));
   }
 
+  /// Abre el stream de video. Si responde 403 reintenta con
+  /// `Range: bytes=0-` (algunos nodos de googlevideo lo exigen).
+  /// Devuelve {client, resp, range}.
+  Future<Map<String, dynamic>> _openVideo(
+      String url, Map<String, String> headers) async {
+    Future<Map<String, dynamic>> attempt(bool useRange) async {
+      final hc = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 30);
+      final req = await hc.getUrl(Uri.parse(url));
+      req.headers.set('User-Agent', ua);
+      headers.forEach((k, v) => req.headers.set(k, v));
+      if (useRange) req.headers.add('range', 'bytes=0-');
+      final resp = await req.close();
+      return {'client': hc, 'resp': resp, 'range': useRange};
+    }
+
+    final first = await attempt(false);
+    final r1 = first['resp'] as HttpClientResponse;
+    if (r1.statusCode == 403) {
+      (first['client'] as HttpClient).close(force: true);
+      return attempt(true);
+    }
+    return first;
+  }
   /// Descarga un archivo a destino concreto con progreso escalado.
   Future<void> _downloadToFile(
     String id,
@@ -1012,13 +1037,11 @@ class IosEngine implements DownloadService {
     double progressFrom = 0,
     double progressTo = 100,
   }) async {
-    final client = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 30);
+    final open = await _openVideo(url, headers ?? const {});
+    final client = open['client'] as HttpClient;
+    final resp = open['resp'] as HttpClientResponse;
+    final usedRange = open['range'] == true;
     _clients[id] = client;
-    final req = await client.getUrl(Uri.parse(url));
-    req.headers.set('User-Agent', ua);
-    headers?.forEach((k, v) => req.headers.set(k, v));
-    final resp = await req.close();
     if (resp.statusCode >= 400) {
       String reason = '';
       try {
@@ -1034,6 +1057,7 @@ class IosEngine implements DownloadService {
       } catch (_) {}
       client.close(force: true);
       throw Exception(_httpError(resp.statusCode, url) +
+          ' | rango:${usedRange ? "si" : "NO"}' +
           (reason.isEmpty ? '' : ' | MOTIVO: $reason'));
     }
     final total = resp.contentLength;
@@ -1118,17 +1142,12 @@ class IosEngine implements DownloadService {
     Map<String, String>? extraHeaders,
   }) async {
     final dir = await downloadDir();
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 30);
+    final open = await _openVideo(url, headers ?? extraHeaders ?? const {});
+    final client = open['client'] as HttpClient;
+    final resp = open['resp'] as HttpClientResponse;
+    final usedRange = open['range'] == true;
     _clients[id] = client;
 
-    final req = await client.getUrl(Uri.parse(url));
-    req.headers.set('User-Agent', ua);
-    (headers ?? extraHeaders ?? const {}).forEach((k, v) { req.headers.set(k, v); });
-    if (extraHeaders != null) {
-      extraHeaders.forEach((k, v) => req.headers.set(k, v));
-    }
-
-    final resp = await req.close();
     if (resp.statusCode >= 400) {
       String reason = '';
       try {
@@ -1147,6 +1166,7 @@ class IosEngine implements DownloadService {
           id: id,
           type: 'error',
           message: _httpError(resp.statusCode, url) +
+              ' | rango:${usedRange ? "si" : "NO"}' +
               (reason.isEmpty ? '' : ' | MOTIVO: $reason')));
       return;
     }
