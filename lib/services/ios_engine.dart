@@ -183,64 +183,178 @@ class IosEngine implements DownloadService {
 
   Future<void> _youtubeFromPage(String id, InAppWebViewController controller,
       bool audioOnly, int maxHeight) async {
-    const js = r'''
-(() => {
-  try {
-    const p = window.ytInitialPlayerResponse;
-    if (!p || !p.streamingData) return null;
-    const f = (p.streamingData.formats || []).filter(x => x.url);
-    return JSON.stringify({
-      title: (p.videoDetails && p.videoDetails.title) || "Video",
-      formats: f.map(x => ({
-        itag: x.itag, url: x.url, h: x.height || 0,
-        w: x.width || 0, mime: x.mimeType || ""
-      }))
-    });
-  } catch (e) { return null; }
-})()
-''';
-    final raw = await controller.evaluateJavascript(source: js);
-    if (raw == null || (raw is String && raw.isEmpty)) {
+    final data = await extractFromPage(controller);
+    final kind = (data['kind'] as String?) ?? 'none';
+
+    if (kind == 'none') {
       _emit(EngineEvent(
           id: id,
           type: 'error',
           message:
-              'YouTube no ofreció descarga directa para este video en iOS (prueba en la pestaña Universal con otra fuente)'));
+              'No se pudo leer el reproductor de YouTube (${data['diag'] ?? ''})'));
       return;
     }
-    final data = jsonDecode(raw is String ? raw : raw.toString())
-        as Map<String, dynamic>;
-    final title = (data['title'] as String?) ?? 'video';
-    final formats = (data['formats'] as List)
-        .map((e) => Map<String, dynamic>.from(e as Map))
-        .where((f) => f['url'] != null)
-        .toList()
-      ..sort((a, b) => (b['h'] as int).compareTo(a['h'] as int));
 
-    Map<String, dynamic>? chosen;
-    for (final f in formats) {
-      final h = f['h'] as int;
-      if (maxHeight <= 0 || h <= maxHeight || chosen == null) chosen = f;
-      if (maxHeight > 0 && h >= maxHeight) break;
+    // MP3: usa el audio adaptativo (existe casi siempre).
+    if (audioOnly) {
+      final audioList = (data['audio'] as List? ?? const []);
+      if (audioList.isNotEmpty) {
+        final a = Map<String, dynamic>.from(audioList.first as Map);
+        final url = a['url'] as String;
+        _emit(EngineEvent(id: id, type: 'progress', progress: 0));
+        await _downloadDirect(id, url, audioOnly: true, title: data['title'] as String?,
+            extraHeaders: {
+              'User-Agent': ua,
+              'Referer': 'https://www.youtube.com/',
+            });
+        return;
+      }
+      final prog = (data['progressive'] as List? ?? const []);
+      if (prog.isEmpty) {
+        _emit(EngineEvent(
+            id: id,
+            type: 'error',
+            message: 'YouTube no ofreció audio para este video (${data['diag'] ?? ''})'));
+        return;
+      }
     }
-    if (chosen == null) {
+
+    // Video: mejor mp4 progresivo (con audio) <= calidad elegida.
+    final prog = (data['progressive'] as List? ?? const [])
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+    if (prog.isEmpty) {
       _emit(EngineEvent(
           id: id,
           type: 'error',
-          message: 'YouTube no tiene formato progresivo disponible'));
+          message: audioOnly
+              ? 'Sin audio disponible (${data['diag'] ?? ''})'
+              : 'Este video solo ofrece formatos separados en iOS (elige MP3 o prueba otro video). ${data['diag'] ?? ''}'));
       return;
     }
-    final h = chosen['h'] as int;
-    final url = chosen['url'] as String;
+    Map<String, dynamic>? chosen;
+    for (final f in prog) {
+      final h = (f['h'] as num?)?.toInt() ?? 0;
+      if (maxHeight <= 0 || h <= maxHeight || chosen == null) chosen = f;
+      if (maxHeight > 0 && h >= maxHeight) break;
+    }
+    final url = chosen!['url'] as String;
+    final h = (chosen['h'] as num?)?.toInt() ?? 0;
     _emit(EngineEvent(
         id: id, type: 'progress', progress: 0, message: 'YouTube ${h}p'));
-
     await _downloadDirect(id, url,
-        audioOnly: audioOnly, title: title, extraHeaders: {
+        audioOnly: audioOnly, title: data['title'] as String?, extraHeaders: {
       'User-Agent': ua,
       'Referer': 'https://www.youtube.com/',
     });
   }
+
+  /// Extrae TODO lo posible de la página cargada (YouTube u otro sitio).
+  /// Devuelve: kind (youtube | hls | video | none), title, thumbnail,
+  /// duration, progressive[], audio[], media, diag.
+  Future<Map<String, dynamic>> extractFromPage(
+      InAppWebViewController controller) async {
+    final raw = await controller.evaluateJavascript(source: _extractJs);
+    Map<String, dynamic> data;
+    try {
+      data = jsonDecode(raw is String ? raw : jsonEncode(raw))
+          as Map<String, dynamic>;
+    } catch (_) {
+      return {
+        'kind': 'none',
+        'diag': 'js-invalido',
+        'progressive': <Map<String, dynamic>>[],
+        'audio': <Map<String, dynamic>>[],
+      };
+    }
+    // Normalizar listas.
+    data['progressive'] = ((data['progressive'] as List?) ?? const [])
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+    data['audio'] = ((data['audio'] as List?) ?? const [])
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+    return data;
+  }
+
+  /// JS multi-fuente de extracción (YouTube + video/HLS embebido).
+  /// IMPORTANTE: sin comillas simples (va dentro de un string raw de Dart).
+  static const _extractJs = r'''
+(() => {
+  const out = {kind:"none", title:"", thumbnail:"", duration:0, media:"",
+               progressive:[], audio:[], diag:""};
+  const parseMaybe = (v) => { try { return (typeof v === "string") ? JSON.parse(v) : v; } catch(e) { return null; } };
+  const getResp = () => {
+    try { if (window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.streamingData) return window.ytInitialPlayerResponse; } catch(e){}
+    try { if (window.ytcfg && typeof ytcfg.get === "function") { const r = parseMaybe(ytcfg.get("PLAYER_RESPONSE")); if (r && r.streamingData) return r; } } catch(e){}
+    try { if (window.ytplayer && ytplayer.config && ytplayer.config.args) { const a = ytplayer.config.args; const r = parseMaybe(a.raw_player_response || a.player_response); if (r && r.streamingData) return r; } } catch(e){}
+    try {
+      const sc = Array.from(document.querySelectorAll("script"));
+      for (const s of sc) {
+        const t = s.textContent || "";
+        const i = t.indexOf("ytInitialPlayerResponse");
+        if (i < 0) continue;
+        const eq = t.indexOf("=", i);
+        if (eq < 0) continue;
+        let depth = 0, start = -1, inStr = false, esc = false;
+        for (let k = eq + 1; k < t.length; k++) {
+          const ch = t.charAt(k);
+          if (inStr) {
+            if (esc) esc = false;
+            else if (ch === "\\") esc = true;
+            else if (ch === "\"") inStr = false;
+            continue;
+          }
+          if (ch === "\"") { inStr = true; continue; }
+          if (ch === "{") { if (depth === 0) start = k; depth++; }
+          else if (ch === "}") { depth--; if (depth === 0 && start >= 0) return JSON.parse(t.slice(start, k + 1)); }
+        }
+      }
+    } catch(e){ out.diag += "scriptscan:" + (e && e.message); }
+    return null;
+  };
+  try {
+    const p = getResp();
+    if (p && p.streamingData) {
+      const vd = p.videoDetails || {};
+      out.title = vd.title || document.title || "Video";
+      try { const th = vd.thumbnail.thumbnails; if (th && th.length) out.thumbnail = th[th.length - 1].url; } catch(e){}
+      out.duration = parseInt(vd.lengthSeconds || "0", 10) || 0;
+      const prog = (p.streamingData.formats || []).filter(x => x.url);
+      prog.sort((a,b) => (b.height||0) - (a.height||0));
+      out.progressive = prog.map(x => ({url:x.url, h:x.height||0}));
+      const aud = (p.streamingData.adaptiveFormats || []).filter(x => x.url && x.mimeType && x.mimeType.indexOf("audio/") === 0);
+      aud.sort((a,b) => (b.bitrate||0) - (a.bitrate||0));
+      out.audio = aud.map(x => ({url:x.url, h:0, br:x.bitrate||0}));
+      if (out.progressive.length) out.kind = "youtube";
+      else if (out.audio.length) out.kind = "youtube-audio";
+      else out.diag += "|solo-adaptativos:" + ((p.streamingData.adaptiveFormats||[]).length);
+    }
+  } catch(e){ out.diag += "|resp:" + (e && e.message); }
+  if (out.kind === "none") {
+    try {
+      const v = document.querySelector("video");
+      const src = (v && (v.currentSrc || v.src)) || "";
+      if (src && src.indexOf("http") === 0) {
+        out.media = src;
+        out.kind = src.indexOf(".m3u8") >= 0 ? "hls" : "video";
+        out.title = out.title || document.title || "Video";
+        try { const m = document.querySelector("meta[property=\"og:image\"]"); if (m && m.content) out.thumbnail = m.content; } catch(e){}
+      }
+    } catch(e){}
+  }
+  if (out.kind === "none") {
+    try {
+      const mi = document.querySelector("meta[property=\"og:image\"]");
+      if (mi && mi.content) out.thumbnail = mi.content;
+      const mt = document.querySelector("meta[property=\"og:title\"]");
+      if (mt && mt.content && !out.title) out.title = mt.content;
+    } catch(e){}
+  }
+  out.diag += "|url:" + location.href + "|ytipr:" + (typeof window.ytInitialPlayerResponse);
+  return JSON.stringify(out);
+})()
+''';
 
   // =========================================================================
   //  Pestaña Universal (solo análisis simple sin navegador)
@@ -315,7 +429,132 @@ class IosEngine implements DownloadService {
       'duration': 0,
       'extractor': kind,
       'webpage_url': media,
+      'kind': kind == 'HLS' ? 'hls' : 'video',
+      'progressive': <Map<String, dynamic>>[],
+      'audio': <Map<String, dynamic>>[],
+      'page_url': media,
     };
+  }
+
+  /// Analiza una página YA CARGADA en el webview oculto de Universal.
+  Future<Map<String, dynamic>> analyzeInPage(
+      InAppWebViewController controller) async {
+    final d = await extractFromPage(controller);
+    final kind = (d['kind'] as String?) ?? 'none';
+    final prog = (d['progressive'] as List);
+    final audio = (d['audio'] as List);
+    final rawTitle = (d['title'] as String?) ?? '';
+    final title = rawTitle.trim().isEmpty ? 'Video' : rawTitle.trim();
+    final pageUrl = (await controller.getUrl())?.toString() ?? '';
+    final thumb = d['thumbnail'];
+
+    if (kind == 'youtube' || kind == 'youtube-audio') {
+      final bestH = prog.isNotEmpty
+          ? ((prog.first['h'] as num?)?.toInt() ?? 0)
+          : 0;
+      final label = kind == 'youtube'
+          ? 'YouTube ${bestH}p'
+          : 'YouTube (solo audio)';
+      return {
+        'ok': true,
+        'title': title,
+        'thumbnail': thumb,
+        'duration': (d['duration'] as num?)?.toInt() ?? 0,
+        'extractor': label,
+        'webpage_url': pageUrl,
+        'kind': kind,
+        'progressive': prog,
+        'audio': audio,
+        'page_url': 'https://www.youtube.com/',
+      };
+    }
+    if (kind == 'hls' || kind == 'video') {
+      return {
+        'ok': true,
+        'title': title,
+        'thumbnail': thumb,
+        'duration': (d['duration'] as num?)?.toInt() ?? 0,
+        'extractor': kind == 'hls' ? 'HLS' : 'Directo',
+        'webpage_url': d['media'],
+        'kind': kind,
+        'progressive': <Map<String, dynamic>>[],
+        'audio': <Map<String, dynamic>>[],
+        'page_url': pageUrl,
+      };
+    }
+    return {
+      'ok': false,
+      'error': 'La página no expone un video descargable. ${d['diag'] ?? ''}'
+    };
+  }
+
+  /// Descarga usando lo analizado en la página (Universal iOS).
+  Future<void> downloadFromAnalyzed({
+    required String id,
+    required Map<String, dynamic> info,
+    required bool audioOnly,
+    required int maxHeight,
+  }) async {
+    _canceled[id] = false;
+    _emit(EngineEvent(id: id, type: 'start'));
+    await _run(id, () async {
+      final kind = (info['kind'] as String?) ?? 'video';
+      final title = info['title'] as String?;
+      final page = (info['page_url'] as String?) ?? '';
+
+      if (audioOnly) {
+        final audio = (info['audio'] as List? ?? const []);
+        final prog = (info['progressive'] as List? ?? const []);
+        String? url;
+        if (audio.isNotEmpty) url = audio.first['url'] as String;
+        if (url == null && prog.isNotEmpty) url = prog.first['url'] as String;
+        if (url == null) {
+          throw Exception('Este video no ofreció audio en iOS');
+        }
+        await _downloadDirect(id, url, audioOnly: true, title: title,
+            extraHeaders: {
+              'User-Agent': ua,
+              'Referer': page.isEmpty ? 'https://www.youtube.com/' : page,
+            });
+        return;
+      }
+
+      if (kind == 'youtube' || kind == 'youtube-audio') {
+        final prog = (info['progressive'] as List? ?? const [])
+            .map((e) => Map<String, dynamic>.from(e as Map))
+            .toList();
+        if (prog.isEmpty) {
+          throw Exception(
+              'Este video solo ofrece formatos separados en iOS (elige MP3)');
+        }
+        Map<String, dynamic>? chosen;
+        for (final f in prog) {
+          final h = (f['h'] as num?)?.toInt() ?? 0;
+          if (maxHeight <= 0 || h <= maxHeight || chosen == null) chosen = f;
+          if (maxHeight > 0 && h >= maxHeight) break;
+        }
+        final h = (chosen!['h'] as num?)?.toInt() ?? 0;
+        _emit(EngineEvent(
+            id: id, type: 'progress', progress: 0, message: 'YouTube ${h}p'));
+        await _downloadDirect(id, chosen['url'] as String,
+            title: title, extraHeaders: {
+              'User-Agent': ua,
+              'Referer': 'https://www.youtube.com/',
+            });
+        return;
+      }
+
+      final media = (info['webpage_url'] as String?) ?? '';
+      if (media.isEmpty) throw Exception('Sin URL de media');
+      if (kind == 'hls' || media.contains('.m3u8')) {
+        await _downloadHls(id, media,
+            title: title,
+            headers: {'User-Agent': ua, 'Referer': page});
+      } else {
+        await _downloadDirect(id, media, title: title,
+            headers: {'User-Agent': ua, 'Referer': page});
+      }
+    });
   }
 
   /// Descarga desde la pestaña Universal (media ya analizado).

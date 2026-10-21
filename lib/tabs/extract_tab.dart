@@ -1,5 +1,9 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import '../services/app_controller.dart';
 import '../services/download_service.dart';
@@ -35,6 +39,11 @@ class _ExtractTabState extends State<ExtractTab>
   bool _audioOnly = false;
   int _maxHeight = -1;
 
+  // iOS: webview oculto que carga la página para analizarla de verdad.
+  InAppWebViewController? _hidden;
+  bool _pendingAnalysis = false;
+  Timer? _analysisTimer;
+
   @override
   bool get wantKeepAlive => true;
 
@@ -50,6 +59,7 @@ class _ExtractTabState extends State<ExtractTab>
 
   @override
   void dispose() {
+    _analysisTimer?.cancel();
     _urlCtrl.dispose();
     super.dispose();
   }
@@ -70,7 +80,37 @@ class _ExtractTabState extends State<ExtractTab>
     if (engine is WindowsEngine) {
       res = await engine.analyze(url);
     } else if (engine is IosEngine) {
-      res = await engine.analyzeUniversal(url);
+      final lower = url.toLowerCase();
+      final isDirect = lower.contains('.m3u8') ||
+          RegExp(r'\.(mp4|mov|m4v|webm|mkv)(\?|$)').hasMatch(lower);
+      if (isDirect) {
+        res = await engine.analyzeUniversal(url);
+      } else {
+        // Cargar la página en el webview oculto y analizarla de verdad
+        // (YouTube, TikTok y cualquier sitio con video embebido).
+        _pendingAnalysis = true;
+        _analysisTimer?.cancel();
+        _analysisTimer = Timer(const Duration(seconds: 35), () {
+          if (_pendingAnalysis && mounted) {
+            _pendingAnalysis = false;
+            setState(() {
+              _loading = false;
+              _error =
+                  'El sitio no cargó a tiempo (red lenta o bloqueo). Reintenta.';
+            });
+          }
+        });
+        final h = _hidden;
+        if (h == null) {
+          setState(() {
+            _loading = false;
+            _error = 'El navegador interno no está listo';
+          });
+        } else {
+          h.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
+        }
+        return;
+      }
     } else {
       res = {'ok': false, 'error': 'No disponible en esta plataforma'};
     }
@@ -89,11 +129,26 @@ class _ExtractTabState extends State<ExtractTab>
     final info = _info;
     if (info == null) return;
     setState(() => _downloading = true);
-    await AppController.instance.startDownload(
-      url: info['webpage_url'] as String,
-      audioOnly: _audioOnly,
-      maxHeight: _maxHeight,
-    );
+    final engine = DownloadService.instance;
+    if (engine is IosEngine && info.containsKey('kind')) {
+      await AppController.instance.runDownload(
+        title: (info['title'] as String?) ?? 'Video',
+        audioOnly: _audioOnly,
+        sourceUrl: (info['webpage_url'] as String?) ?? '',
+        runner: (id) => engine.downloadFromAnalyzed(
+          id: id,
+          info: info,
+          audioOnly: _audioOnly,
+          maxHeight: _maxHeight,
+        ),
+      );
+    } else {
+      await AppController.instance.startDownload(
+        url: info['webpage_url'] as String,
+        audioOnly: _audioOnly,
+        maxHeight: _maxHeight,
+      );
+    }
     if (!mounted) return;
     setState(() => _downloading = false);
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -122,7 +177,62 @@ class _ExtractTabState extends State<ExtractTab>
     final scheme = Theme.of(context).colorScheme;
     final info = _info;
 
-    return ListView(
+    return Column(
+      children: [
+        // iOS: navegador oculto que carga la página para analizarla.
+        if (Platform.isIOS)
+          SizedBox(
+            height: 1,
+            child: InAppWebView(
+              initialUrlRequest: URLRequest(url: WebUri('about:blank')),
+              initialSettings: InAppWebViewSettings(
+                javaScriptEnabled: true,
+                mediaPlaybackRequiresUserGesture: false,
+                useShouldOverrideUrlLoading: false,
+                clearCache: false,
+              ),
+              onWebViewCreated: (c) => _hidden = c,
+              onLoadStop: (c, url) async {
+                if (!_pendingAnalysis) return;
+                final u = url?.toString() ?? '';
+                if (u.isEmpty || u == 'about:blank') return;
+                _pendingAnalysis = false;
+                _analysisTimer?.cancel();
+                // Esperar a que el reproductor inicialice su respuesta.
+                await Future.delayed(const Duration(seconds: 3));
+                if (!mounted) return;
+                final eng = DownloadService.instance;
+                final Map<String, dynamic> res =
+                    eng is IosEngine ? await eng.analyzeInPage(c) : {'ok': false};
+                if (!mounted) return;
+                setState(() {
+                  _loading = false;
+                  if (res['ok'] == true) {
+                    _info = res;
+                    _error = null;
+                  } else {
+                    _error =
+                        res['error'] as String? ?? 'No se pudo analizar la página';
+                  }
+                });
+              },
+              onReceivedError: (c, request, error) {
+                if (_pendingAnalysis &&
+                    (request.isForMainFrame != false)) {
+                  _pendingAnalysis = false;
+                  _analysisTimer?.cancel();
+                  if (mounted) {
+                    setState(() {
+                      _loading = false;
+                      _error = 'No se pudo cargar la página (${error.description})';
+                    });
+                  }
+                }
+              },
+            ),
+          ),
+        Expanded(
+          child: ListView(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
       children: [
         Row(children: [
@@ -326,6 +436,9 @@ class _ExtractTabState extends State<ExtractTab>
               ),
             ),
           ),
+            ],
+          ),
+        ),
       ],
     );
   }

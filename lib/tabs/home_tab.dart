@@ -65,14 +65,15 @@ class _HomeTabState extends State<HomeTab>
           content: Text('Pega primero un enlace de YouTube o TikTok')));
       return;
     }
-    // En iOS YouTube/TikTok se descargan desde su pestaña (necesitan
-    // leer el video reproduciéndose en la página).
+    // En iOS YouTube/TikTok/Cualquier sitio se descargan desde la
+    // pestaña Universal (lee el video de la página con su navegador)
+    // o desde la pestaña del sitio correspondiente.
     if (Platform.isIOS) {
       final u = url.toLowerCase();
       if (u.contains('youtu')) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
             content: Text(
-                'En iOS: abre el video en la pestaña YouTube y usa su botón Descargar')));
+                'En iOS: pega el enlace en la pestaña Universal (analiza el video) o ábrelo en YouTube y usa Descargar')));
         return;
       }
       if (u.contains('tiktok')) {
