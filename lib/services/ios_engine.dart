@@ -186,6 +186,23 @@ class IosEngine implements DownloadService {
     final data = await extractFromPage(controller);
     final kind = (data['kind'] as String?) ?? 'none';
 
+    if (kind == 'youtube-hls') {
+      // YouTube vía HLS: calidad completa con audio (y MP3 si se pide).
+      final media = (data['media'] as String?) ?? '';
+      if (media.isEmpty) {
+        _emit(EngineEvent(
+            id: id, type: 'error', message: 'Sin manifiest HLS'));
+        return;
+      }
+      _emit(EngineEvent(
+          id: id, type: 'progress', progress: 0, message: 'YouTube HD'));
+      await _downloadHls(id, media,
+          title: data['title'] as String?,
+          audioOnly: audioOnly,
+          headers: const {'Referer': 'https://www.youtube.com/'});
+      return;
+    }
+
     if (kind == 'none') {
       _emit(EngineEvent(
           id: id,
@@ -326,9 +343,17 @@ class IosEngine implements DownloadService {
       const aud = (p.streamingData.adaptiveFormats || []).filter(x => x.url && x.mimeType && x.mimeType.indexOf("audio/") === 0);
       aud.sort((a,b) => (b.bitrate||0) - (a.bitrate||0));
       out.audio = aud.map(x => ({url:x.url, h:0, br:x.bitrate||0}));
-      if (out.progressive.length) out.kind = "youtube";
-      else if (out.audio.length) out.kind = "youtube-audio";
-      else out.diag += "|solo-adaptativos:" + ((p.streamingData.adaptiveFormats||[]).length);
+      // iPhone: YouTube sirve HLS (calidad completa con audio) via hlsManifestUrl.
+      if (p.streamingData.hlsManifestUrl) {
+        out.media = p.streamingData.hlsManifestUrl;
+        out.kind = "youtube-hls";
+      } else if (out.progressive.length) {
+        out.kind = "youtube";
+      } else if (out.audio.length) {
+        out.kind = "youtube-audio";
+      } else {
+        out.diag += "|solo-adaptativos:" + ((p.streamingData.adaptiveFormats||[]).length);
+      }
     }
   } catch(e){ out.diag += "|resp:" + (e && e.message); }
   if (out.kind === "none") {
@@ -448,20 +473,26 @@ class IosEngine implements DownloadService {
     final pageUrl = (await controller.getUrl())?.toString() ?? '';
     final thumb = d['thumbnail'];
 
-    if (kind == 'youtube' || kind == 'youtube-audio') {
+    if (kind == 'youtube' || kind == 'youtube-audio' || kind == 'youtube-hls') {
       final bestH = prog.isNotEmpty
           ? ((prog.first['h'] as num?)?.toInt() ?? 0)
           : 0;
-      final label = kind == 'youtube'
-          ? 'YouTube ${bestH}p'
-          : 'YouTube (solo audio)';
+      final String label;
+      if (kind == 'youtube-hls') {
+        label = 'YouTube HD (HLS)';
+      } else if (kind == 'youtube') {
+        label = 'YouTube ${bestH}p';
+      } else {
+        label = 'YouTube (solo audio)';
+      }
       return {
         'ok': true,
         'title': title,
         'thumbnail': thumb,
         'duration': (d['duration'] as num?)?.toInt() ?? 0,
         'extractor': label,
-        'webpage_url': pageUrl,
+        'webpage_url':
+            kind == 'youtube-hls' ? (d['media'] ?? pageUrl) : pageUrl,
         'kind': kind,
         'progressive': prog,
         'audio': audio,
@@ -516,6 +547,19 @@ class IosEngine implements DownloadService {
               'User-Agent': ua,
               'Referer': page.isEmpty ? 'https://www.youtube.com/' : page,
             });
+        return;
+      }
+
+      if (kind == 'youtube-hls') {
+        // YouTube para iPhone: manifiest HLS con video+audio (hasta 1080p).
+        final media = (info['webpage_url'] as String?) ?? '';
+        if (media.isEmpty) throw Exception('Sin manifiest HLS de YouTube');
+        _emit(EngineEvent(
+            id: id, type: 'progress', progress: 0, message: 'YouTube HD'));
+        await _downloadHls(id, media,
+            title: title,
+            audioOnly: audioOnly,
+            headers: const {'Referer': 'https://www.youtube.com/'});
         return;
       }
 
