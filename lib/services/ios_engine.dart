@@ -41,6 +41,52 @@ class IosEngine implements DownloadService {
     }
   }
 
+  /// Ultimo cliente InnerTube usado (para diagnosticos de error).
+  String _lastClient = '';
+
+  /// Cookies de la sesion del navegador (YouTube logueado) para las
+  /// peticiones de descarga - googlevideo puede exigirlas.
+  String? sessionCookies;
+
+  /// Carga las cookies de YouTube del navegador integrado.
+  Future<void> loadCookies(InAppWebViewController controller) async {
+    try {
+      final cm = CookieManager();
+      final parts = <String>[];
+      for (final target in [
+        'https://www.youtube.com/',
+        'https://accounts.google.com/',
+      ]) {
+        final list = await cm.getCookies(url: WebUri(target));
+        for (final c in list) {
+          if (c.name.isNotEmpty) parts.add('${c.name}=${c.value}');
+        }
+      }
+      if (parts.isNotEmpty) sessionCookies = parts.join('; ');
+    } catch (_) {}
+  }
+
+  Map<String, String> _ytHeaders(String clientUa) {
+    final h = <String, String>{'User-Agent': clientUa};
+    h['Referer'] = 'https://www.youtube.com/';
+    final ck = sessionCookies;
+    if (ck != null && ck.isNotEmpty) h['Cookie'] = ck;
+    return h;
+  }
+
+  /// Mensaje rico para errores HTTP (host, cliente, cookies).
+  String _httpError(int code, String url) {
+    String host;
+    try {
+      host = Uri.parse(url).host;
+    } catch (_) {
+      host = '?';
+    }
+    final hasCookie = sessionCookies != null && sessionCookies!.isNotEmpty;
+    return 'El servidor respondio HTTP $code (host: $host | cliente: '
+        '${_lastClient.isEmpty ? "?" : _lastClient} | cookies: ${hasCookie ? "si" : "NO"})';
+  }
+
   final _controller = StreamController<EngineEvent>.broadcast();
   final Map<String, HttpClient> _clients = {};
   final Map<String, bool> _canceled = {};
@@ -203,11 +249,9 @@ class IosEngine implements DownloadService {
       bool audioOnly, int maxHeight) async {
     final data = await extractFromPage(controller);
     final kind = (data['kind'] as String?) ?? 'none';
-    final clientUa = _uaForClient((data['client'] as String?) ?? 'WEB');
-    final ytHeaders = {
-      'User-Agent': clientUa,
-      'Referer': 'https://www.youtube.com/',
-    };
+    _lastClient = (data['client'] as String?) ?? 'WEB';
+    final clientUa = _uaForClient(_lastClient);
+    final ytHeaders = _ytHeaders(clientUa);
 
     if (kind == 'youtube-hls') {
       final media = (data['media'] as String?) ?? '';
@@ -799,7 +843,8 @@ class IosEngine implements DownloadService {
       final kind = (info['kind'] as String?) ?? 'video';
       final title = info['title'] as String?;
       final page = (info['page_url'] as String?) ?? '';
-      final clientUa = _uaForClient((info['client'] as String?) ?? 'WEB');
+      _lastClient = (info['client'] as String?) ?? 'WEB';
+      final clientUa = _uaForClient(_lastClient);
 
       if (audioOnly) {
         final audio = (info['audio'] as List? ?? const []);
@@ -811,10 +856,7 @@ class IosEngine implements DownloadService {
           throw Exception('Este video no ofrecio audio en iOS');
         }
         await _downloadDirect(id, url, audioOnly: true, title: title,
-            extraHeaders: {
-              'User-Agent': clientUa,
-              'Referer': page.isEmpty ? 'https://www.youtube.com/' : page,
-            });
+            extraHeaders: _ytHeaders(clientUa));
         return;
       }
 
@@ -826,10 +868,7 @@ class IosEngine implements DownloadService {
         await _downloadHls(id, media,
             title: title,
             audioOnly: audioOnly,
-            headers: {
-              'User-Agent': clientUa,
-              'Referer': 'https://www.youtube.com/',
-            });
+            headers: _ytHeaders(clientUa));
         return;
       }
 
@@ -874,10 +913,7 @@ class IosEngine implements DownloadService {
         _emit(EngineEvent(
             id: id, type: 'progress', progress: 0, message: 'YouTube ${h}p'));
         await _downloadDirect(id, chosen['url'] as String,
-            title: title, extraHeaders: {
-              'User-Agent': clientUa,
-              'Referer': 'https://www.youtube.com/',
-            });
+            title: title, extraHeaders: _ytHeaders(clientUa));
         return;
       }
 
@@ -908,10 +944,7 @@ class IosEngine implements DownloadService {
     work.createSync(recursive: true);
     final vFile = File('${work.path}/video.mp4');
     final aFile = File('${work.path}/audio.m4a');
-    final ytHeaders = {
-      'User-Agent': clientUa,
-      'Referer': 'https://www.youtube.com/',
-    };
+    final ytHeaders = _ytHeaders(clientUa);
 
     _emit(EngineEvent(
         id: id, type: 'progress', progress: 0, message: 'Video...'));
@@ -962,7 +995,7 @@ class IosEngine implements DownloadService {
     final resp = await req.close();
     if (resp.statusCode >= 400) {
       client.close(force: true);
-      throw Exception('El servidor respondio HTTP ${resp.statusCode}');
+      throw Exception(_httpError(resp.statusCode, url));
     }
     final total = resp.contentLength;
     var received = 0;
@@ -1062,7 +1095,7 @@ class IosEngine implements DownloadService {
       _emit(EngineEvent(
           id: id,
           type: 'error',
-          message: 'El servidor respondió HTTP ${resp.statusCode}'));
+          message: _httpError(resp.statusCode, url)));
       return;
     }
 

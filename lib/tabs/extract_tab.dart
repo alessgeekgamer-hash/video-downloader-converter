@@ -131,6 +131,8 @@ class _ExtractTabState extends State<ExtractTab>
     setState(() => _downloading = true);
     final engine = DownloadService.instance;
     if (engine is IosEngine && info.containsKey('kind')) {
+      final hidden = _hidden;
+      if (hidden != null) await engine.loadCookies(hidden);
       await AppController.instance.runDownload(
         title: (info['title'] as String?) ?? 'Video',
         audioOnly: _audioOnly,

@@ -192,14 +192,16 @@ class _WebTabState extends State<WebTab> with AutomaticKeepAliveClientMixin {
               GradientButton(
                 semanticsLabel:
                     audioOnly ? 'Descargar MP3' : 'Descargar MP4',
-                onPressed: () {
+                onPressed: () async {
                   Navigator.of(sheetContext).pop();
                   final controller = _controller;
                   final engine = DownloadService.instance;
                   if (Platform.isIOS &&
                       controller != null &&
                       engine is IosEngine) {
-                    // iOS: extraer la fuente del video desde la propia página.
+                    // iOS: extraer la fuente del video desde la propia página
+                    // y llevar las cookies de la sesión (YouTube logueado).
+                    await engine.loadCookies(controller);
                     AppController.instance.runDownload(
                       title: 'Video de ${widget.title}',
                       audioOnly: audioOnly,
