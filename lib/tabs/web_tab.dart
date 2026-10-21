@@ -222,6 +222,7 @@ class _WebTabState extends State<WebTab> with AutomaticKeepAliveClientMixin {
                       maxHeight: maxHeight,
                     );
                   }
+                  if (!mounted) return;
                   ScaffoldMessenger.of(context).showSnackBar(SnackBar(
                     content: const Text('Descarga iniciada'),
                     action: SnackBarAction(

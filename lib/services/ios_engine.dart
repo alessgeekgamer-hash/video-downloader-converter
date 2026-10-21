@@ -994,8 +994,21 @@ class IosEngine implements DownloadService {
     headers?.forEach((k, v) => req.headers.set(k, v));
     final resp = await req.close();
     if (resp.statusCode >= 400) {
+      String reason = '';
+      try {
+        final bodyText = await resp
+            .transform(utf8.decoder)
+            .join()
+            .timeout(const Duration(seconds: 5));
+        reason = bodyText
+            .replaceAll(RegExp(r'<[^>]+>'), ' ')
+            .replaceAll(RegExp(r'\s+'), ' ')
+            .trim();
+        if (reason.length > 200) reason = reason.substring(0, 200);
+      } catch (_) {}
       client.close(force: true);
-      throw Exception(_httpError(resp.statusCode, url));
+      throw Exception(_httpError(resp.statusCode, url) +
+          (reason.isEmpty ? '' : ' | MOTIVO: $reason'));
     }
     final total = resp.contentLength;
     var received = 0;
@@ -1091,11 +1104,24 @@ class IosEngine implements DownloadService {
 
     final resp = await req.close();
     if (resp.statusCode >= 400) {
+      String reason = '';
+      try {
+        final bodyText = await resp
+            .transform(utf8.decoder)
+            .join()
+            .timeout(const Duration(seconds: 5));
+        reason = bodyText
+            .replaceAll(RegExp(r'<[^>]+>'), ' ')
+            .replaceAll(RegExp(r'\s+'), ' ')
+            .trim();
+        if (reason.length > 200) reason = reason.substring(0, 200);
+      } catch (_) {}
       client.close(force: true);
       _emit(EngineEvent(
           id: id,
           type: 'error',
-          message: _httpError(resp.statusCode, url)));
+          message: _httpError(resp.statusCode, url) +
+              (reason.isEmpty ? '' : ' | MOTIVO: $reason')));
       return;
     }
 
