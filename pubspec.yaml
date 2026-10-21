@@ -93,3 +93,7 @@ flutter:
   #
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
+
+dependency_overrides:
+  # 2.5.1 cambio la clase Android del plugin y rompe GeneratedPluginRegistrant
+  shared_preferences_android: 2.5.0
