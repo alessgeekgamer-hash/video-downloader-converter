@@ -308,10 +308,8 @@ class IosEngine implements DownloadService {
         },
       ];
       for (final cl in clients) {
-        if (!mounted) break;
         final name = cl['clientName'] as String;
-        await controller.evaluateJavascript(
-            source: _innertubeJs(jsonEncode(cl)));
+        await controller.evaluateJavascript(source: _innertubeJs(cl));
         String? raw;
         for (var i = 0; i < 12; i++) {
           await Future.delayed(const Duration(seconds: 1));
