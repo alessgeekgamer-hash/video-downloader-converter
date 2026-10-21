@@ -123,8 +123,8 @@ class _AppShellState extends State<AppShell> {
   @override
   Widget build(BuildContext context) {
     // La pestaña Universal (descargar de cualquier sitio por URL) es
-    // solo para la versión de Windows.
-    final showUniversal = Platform.isWindows;
+    // para Windows (yt-dlp) y iOS (descarga directa/HLS por HTML).
+    final showUniversal = Platform.isWindows || Platform.isIOS;
 
     final destinations = <NavigationDestination>[
       const NavigationDestination(

@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import '../services/app_controller.dart';
+import '../services/download_service.dart';
+import '../services/ios_engine.dart';
 import '../widgets/gradient_button.dart';
 
 /// Pestaña de navegación reutilizable para YouTube y TikTok, con botón
@@ -39,6 +41,10 @@ class _WebTabState extends State<WebTab> with AutomaticKeepAliveClientMixin {
   double _progress = 0;
   bool _canGoBack = false;
   bool _canGoForward = false;
+
+  // iOS: último stream .m3u8 visto (TikTok reproduce HLS).
+  String? _lastStreamUrl;
+  String? _lastStreamPage;
 
   @override
   bool get wantKeepAlive => true;
@@ -188,11 +194,32 @@ class _WebTabState extends State<WebTab> with AutomaticKeepAliveClientMixin {
                     audioOnly ? 'Descargar MP3' : 'Descargar MP4',
                 onPressed: () {
                   Navigator.of(sheetContext).pop();
-                  AppController.instance.startDownload(
-                    url: url,
-                    audioOnly: audioOnly,
-                    maxHeight: maxHeight,
-                  );
+                  final controller = _controller;
+                  final engine = DownloadService.instance;
+                  if (Platform.isIOS &&
+                      controller != null &&
+                      engine is IosEngine) {
+                    // iOS: extraer la fuente del video desde la propia página.
+                    AppController.instance.runDownload(
+                      title: 'Video de ${widget.title}',
+                      audioOnly: audioOnly,
+                      sourceUrl: _currentUrl ?? widget.initialUrl,
+                      runner: (id) => engine.downloadFromWebTab(
+                        id: id,
+                        controller: controller,
+                        audioOnly: audioOnly,
+                        maxHeight: maxHeight,
+                        fallbackStreamUrl: _lastStreamUrl,
+                        fallbackPageUrl: _lastStreamPage ?? _currentUrl,
+                      ),
+                    );
+                  } else {
+                    AppController.instance.startDownload(
+                      url: url,
+                      audioOnly: audioOnly,
+                      maxHeight: maxHeight,
+                    );
+                  }
                   ScaffoldMessenger.of(context).showSnackBar(SnackBar(
                     content: const Text('Descarga iniciada'),
                     action: SnackBarAction(
@@ -356,6 +383,16 @@ class _WebTabState extends State<WebTab> with AutomaticKeepAliveClientMixin {
                 },
                 onProgressChanged: (c, progress) =>
                     setState(() => _progress = progress / 100),
+                // iOS: capturar streams .m3u8 del reproductor (TikTok HLS).
+                onLoadResource: Platform.isIOS
+                    ? (c, resource) {
+                        final u = resource.url?.toString() ?? '';
+                        if (u.contains('.m3u8')) {
+                          _lastStreamUrl = u;
+                          _lastStreamPage = _currentUrl;
+                        }
+                      }
+                    : null,
                 // Las ventanas emergentes (como el inicio de sesión de Google)
                 // se cargan en la misma pestaña para no perderlas.
                 onCreateWindow: Platform.isAndroid

@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/download_item.dart';
 import 'download_service.dart';
+import 'ios_engine.dart';
 
 /// Estado global de la aplicación: motor de descarga + lista de descargas.
 class AppController extends ChangeNotifier {
@@ -159,6 +160,8 @@ class AppController extends ChangeNotifier {
     try {
       if (_engine is WindowsEngine) {
         await _engine.convertLocal(id, inputPath, downloadFolder);
+      } else if (_engine is IosEngine) {
+        await _engine.convertLocal(id, inputPath);
       } else {
         await _engine.startDownload(
           id: id,
@@ -176,6 +179,34 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> cancel(String id) => _engine.cancel(id);
+
+  /// Ejecuta un runner personalizado creando la tarjeta de descarga
+  /// (usado por iOS, que necesita contexto del navegador para extraer
+  /// la URL del video).
+  Future<void> runDownload({
+    required String title,
+    required bool audioOnly,
+    required String sourceUrl,
+    required Future<void> Function(String id) runner,
+  }) async {
+    final id =
+        'wb-${DateTime.now().millisecondsSinceEpoch}-${Random().nextInt(9999)}';
+    final item = DownloadItem(
+      id: id,
+      url: sourceUrl,
+      title: title,
+      audioOnly: audioOnly,
+    );
+    items.insert(0, item);
+    notifyListeners();
+    try {
+      await runner(id);
+    } catch (e) {
+      item.status = DownloadStatus.error;
+      item.message = e.toString();
+      notifyListeners();
+    }
+  }
 
   Future<String> updateEngine() async {
     final msg = await _engine.updateEngine();

@@ -5,6 +5,8 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/services.dart';
 
+import 'ios_engine.dart';
+
 /// Evento emitido por el motor nativo (Android) o por el proceso (Windows).
 class EngineEvent {
   final String id;
@@ -29,7 +31,9 @@ class EngineEvent {
 /// yt-dlp.exe y ffmpeg.exe incluidos junto al ejecutable.
 abstract class DownloadService {
   static DownloadService get instance {
-    return Platform.isWindows ? WindowsEngine() : AndroidEngine();
+    if (Platform.isWindows) return WindowsEngine();
+    if (Platform.isIOS) return IosEngine.instance;
+    return AndroidEngine();
   }
 
   Future<Map<String, dynamic>> initEngine();

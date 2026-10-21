@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -62,6 +64,23 @@ class _HomeTabState extends State<HomeTab>
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text('Pega primero un enlace de YouTube o TikTok')));
       return;
+    }
+    // En iOS YouTube/TikTok se descargan desde su pestaña (necesitan
+    // leer el video reproduciéndose en la página).
+    if (Platform.isIOS) {
+      final u = url.toLowerCase();
+      if (u.contains('youtu')) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text(
+                'En iOS: abre el video en la pestaña YouTube y usa su botón Descargar')));
+        return;
+      }
+      if (u.contains('tiktok')) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text(
+                'En iOS: abre el video en la pestaña TikTok y usa su botón Descargar')));
+        return;
+      }
     }
     final app = AppController.instance;
     if (app.engineStatus != 'ready') {

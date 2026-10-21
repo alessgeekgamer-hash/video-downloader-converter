@@ -39,6 +39,7 @@ dependencies:
   file_picker: ^13.1.0
   shared_preferences: ^2.5.6
   flutter_inappwebview_windows: ^0.6.0
+  ffmpeg_kit_flutter_new_full: ^2.5.7
 
 dev_dependencies:
   flutter_test:

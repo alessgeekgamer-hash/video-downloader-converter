@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 
 import '../services/app_controller.dart';
 import '../services/download_service.dart';
+import '../services/ios_engine.dart';
 import '../widgets/gradient_button.dart';
 
 /// Pestaña (solo Windows) para descargar videos de CUALQUIER sitio
@@ -68,6 +69,8 @@ class _ExtractTabState extends State<ExtractTab>
     Map<String, dynamic> res;
     if (engine is WindowsEngine) {
       res = await engine.analyze(url);
+    } else if (engine is IosEngine) {
+      res = await engine.analyzeUniversal(url);
     } else {
       res = {'ok': false, 'error': 'No disponible en esta plataforma'};
     }
