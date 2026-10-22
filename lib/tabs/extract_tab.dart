@@ -142,6 +142,7 @@ class _ExtractTabState extends State<ExtractTab>
           info: info,
           audioOnly: _audioOnly,
           maxHeight: _maxHeight,
+          controller: hidden,
         ),
       );
     } else {

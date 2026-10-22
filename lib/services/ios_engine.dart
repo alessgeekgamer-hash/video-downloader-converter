@@ -41,6 +41,35 @@ class IosEngine implements DownloadService {
     }
   }
 
+  /// HttpClient con IPv4 FORZADO: el ip= del player debe coincidir con el
+  /// de la descarga siempre (los carriers moviles rotan IPv4/IPv6).
+  HttpClient _newHttp([Duration? timeout]) {
+    final hc = HttpClient()
+      ..connectionTimeout = timeout ?? const Duration(seconds: 30);
+    try {
+      hc.connectionFactory = (uri, host, port) async {
+        Future<Socket> future;
+        try {
+          // Forzar IPv4: si el carrier usa IPv6 para una peticion y IPv4
+          // para otra, el ip= embebido no coincide y googlevideo da403.
+          final addrs = await InternetAddress.lookup(host!,
+              type: InternetAddressType.IPv4);
+          future = addrs.isEmpty
+              ? Socket.connect(host, port!,
+                  timeout: const Duration(seconds: 30))
+              : Socket.connect(addrs.first, port!,
+                  timeout: const Duration(seconds: 30));
+        } catch (_) {
+          future = Socket.connect(host, port!,
+              timeout: const Duration(seconds: 30));
+        }
+        return ConnectionTask.fromSocket(future, () {
+          future.then((s) => s.destroy(), onError: (_) {});
+        });
+      };
+    } catch (_) {}
+    return hc;
+  }
   /// Ultimo cliente InnerTube usado (para diagnosticos de error).
   String _lastClient = '';
 
@@ -258,7 +287,48 @@ class IosEngine implements DownloadService {
 
   Future<void> _youtubeFromPage(String id, InAppWebViewController controller,
       bool audioOnly, int maxHeight) async {
-    final data = await extractFromPage(controller);
+    var data = await extractFromPage(controller);
+    if ((data['kind'] as String?) == 'none') {
+      _emit(EngineEvent(
+          id: id,
+          type: 'error',
+          message:
+              'No se pudo leer el reproductor de YouTube (${data['diag'] ?? ''})'));
+      return;
+    }
+
+    // Reintento anti-403: en carriers moviles la IP puede rotar entre el
+    // player y la descarga; se pide una URL fresca y reintenta (3 veces).
+    Object? lastError;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) {
+        _emit(EngineEvent(
+            id: id,
+            type: 'progress',
+            progress: 0,
+            message: 'Reintento ${attempt + 1}/3 (IP cambio)'));
+        await Future.delayed(const Duration(seconds: 2));
+        final fresh = await extractFromPage(controller);
+        if ((fresh['kind'] as String?) == 'none') break;
+        data = fresh;
+      }
+      try {
+        await _ytDownloadStep(id, data, audioOnly, maxHeight);
+        return;
+      } catch (e) {
+        lastError = e;
+        if (!e.toString().contains('403')) break;
+      }
+    }
+    _emit(EngineEvent(
+        id: id,
+        type: 'error',
+        message: 'Falló tras reintentos: ${lastError ?? "error desconocido"}'));
+  }
+
+  /// Un intento de descarga de YouTube (usado tambien por Universal).
+  Future<void> _ytDownloadStep(String id, Map<String, dynamic> data,
+      bool audioOnly, int maxHeight) async {
     final kind = (data['kind'] as String?) ?? 'none';
     _lastClient = (data['client'] as String?) ?? 'WEB';
     final clientUa = _uaForClient(_lastClient);
@@ -266,11 +336,7 @@ class IosEngine implements DownloadService {
 
     if (kind == 'youtube-hls') {
       final media = (data['media'] as String?) ?? '';
-      if (media.isEmpty) {
-        _emit(EngineEvent(
-            id: id, type: 'error', message: 'Sin manifiest HLS'));
-        return;
-      }
+      if (media.isEmpty) throw Exception('Sin manifiest HLS');
       _emit(EngineEvent(
           id: id, type: 'progress', progress: 0, message: 'YouTube HD'));
       await _downloadHls(id, media,
@@ -280,35 +346,22 @@ class IosEngine implements DownloadService {
       return;
     }
 
-    if (kind == 'none') {
-      _emit(EngineEvent(
-          id: id,
-          type: 'error',
-          message:
-              'No se pudo leer el reproductor de YouTube (${data['diag'] ?? ''})'));
-      return;
-    }
-
-    // MP3: usa el audio adaptativo (existe casi siempre).
     if (audioOnly) {
       final audioList = (data['audio'] as List? ?? const []);
       if (audioList.isNotEmpty) {
         final a = Map<String, dynamic>.from(audioList.first as Map);
-        final url = a['url'] as String;
         _emit(EngineEvent(id: id, type: 'progress', progress: 0));
-        await _downloadDirect(id, url,
+        await _downloadDirect(id, a['url'] as String,
             audioOnly: true, title: data['title'] as String?, extraHeaders: ytHeaders);
         return;
       }
-      _emit(EngineEvent(
-          id: id,
-          type: 'error',
-          message:
-              'YouTube no ofrecio audio para este video (${data['diag'] ?? ''})'));
-      return;
+      final prog0 = (data['progressive'] as List? ?? const []);
+      if (prog0.isEmpty) {
+        throw Exception(
+            'YouTube no ofrecio audio (${data['diag'] ?? ''})');
+      }
     }
 
-    // Video: progresivo si existe; si no, unir adaptativos con ffmpeg.
     final prog = (data['progressive'] as List? ?? const [])
         .map((e) => Map<String, dynamic>.from(e as Map))
         .toList();
@@ -335,12 +388,8 @@ class IosEngine implements DownloadService {
         );
         return;
       }
-      _emit(EngineEvent(
-          id: id,
-          type: 'error',
-          message:
-              'Este video solo ofrece formatos separados en iOS (elige MP3 o prueba otro video). ${data['diag'] ?? ''}'));
-      return;
+      throw Exception(
+          'Este video solo ofrece formatos separados en iOS (elige MP3). ${data['diag'] ?? ''}');
     }
     Map<String, dynamic>? chosen;
     for (final f in prog) {
@@ -576,8 +625,7 @@ class IosEngine implements DownloadService {
       'racyCheckOk': true,
       'context': {'client': client},
     });
-    final hc = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 20);
+    final hc = _newHttp(const Duration(seconds: 20));
     try {
       final req = await hc.postUrl(uri);
       req.headers.contentType =
@@ -736,7 +784,7 @@ class IosEngine implements DownloadService {
       return _universalOk(url, 'Directo', _basename(url));
     }
     try {
-      final client = HttpClient()..connectionTimeout = const Duration(seconds: 20);
+    final client = _newHttp(const Duration(seconds: 20));
       final req = await client.getUrl(Uri.parse(url));
       req.headers.set('User-Agent', ua);
       req.followRedirects = true;
@@ -863,15 +911,55 @@ class IosEngine implements DownloadService {
     required Map<String, dynamic> info,
     required bool audioOnly,
     required int maxHeight,
+    InAppWebViewController? controller,
   }) async {
+    final kind0 = (info['kind'] as String?) ?? 'video';
+    final isYoutube = kind0 == 'youtube' ||
+        kind0 == 'youtube-audio' ||
+        kind0 == 'youtube-hls';
+
+    // YouTube: misma logica de reintentos anti-403 (URL fresca si la IP
+    // del carrier rota entre player y descarga).
+    if (isYoutube && controller != null) {
+      _canceled[id] = false;
+      _emit(EngineEvent(id: id, type: 'start'));
+      Object? lastError;
+      var data = info;
+      for (var attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+          _emit(EngineEvent(
+              id: id,
+              type: 'progress',
+              progress: 0,
+              message: 'Reintento ${attempt + 1}/3 (IP cambio)'));
+          await Future.delayed(const Duration(seconds: 2));
+          final fresh = await extractFromPage(controller);
+          if ((fresh['kind'] as String?) == 'none') break;
+          data = fresh;
+        }
+        try {
+          await _ytDownloadStep(id, data, audioOnly, maxHeight);
+          return;
+        } catch (e) {
+          lastError = e;
+          if (!e.toString().contains('403')) break;
+        }
+      }
+      _emit(EngineEvent(
+          id: id,
+          type: 'error',
+          message:
+              'Fallo tras reintentos: ${lastError ?? "error desconocido"}'));
+      return;
+    }
+
     _canceled[id] = false;
     _emit(EngineEvent(id: id, type: 'start'));
     await _run(id, () async {
-      final kind = (info['kind'] as String?) ?? 'video';
+      final kind = kind0;
       final title = info['title'] as String?;
       final page = (info['page_url'] as String?) ?? '';
-      _lastClient = (info['client'] as String?) ?? 'WEB';
-      final clientUa = _uaForClient(_lastClient);
+      final clientUa = _uaForClient((info['client'] as String?) ?? 'WEB');
 
       if (audioOnly) {
         final audio = (info['audio'] as List? ?? const []);
@@ -882,65 +970,8 @@ class IosEngine implements DownloadService {
         if (url == null) {
           throw Exception('Este video no ofrecio audio en iOS');
         }
-        await _downloadDirect(id, url, audioOnly: true, title: title,
-            extraHeaders: _ytHeaders(clientUa));
-        return;
-      }
-
-      if (kind == 'youtube-hls') {
-        final media = (info['webpage_url'] as String?) ?? '';
-        if (media.isEmpty) throw Exception('Sin manifiest HLS de YouTube');
-        _emit(EngineEvent(
-            id: id, type: 'progress', progress: 0, message: 'YouTube HD'));
-        await _downloadHls(id, media,
-            title: title,
-            audioOnly: audioOnly,
-            headers: _ytHeaders(clientUa));
-        return;
-      }
-
-      if (kind == 'youtube' || kind == 'youtube-audio') {
-        final prog = (info['progressive'] as List? ?? const [])
-            .map((e) => Map<String, dynamic>.from(e as Map))
-            .toList();
-        if (prog.isEmpty) {
-          // Sin progresivo: unir video+audio adaptativos con ffmpeg.
-          final av = (info['adaptiveVideo'] as List? ?? const [])
-              .map((e) => Map<String, dynamic>.from(e as Map))
-              .toList();
-          final audio = (info['audio'] as List? ?? const [])
-              .map((e) => Map<String, dynamic>.from(e as Map))
-              .toList();
-          Map<String, dynamic>? v;
-          for (final f in av) {
-            final h = (f['h'] as num?)?.toInt() ?? 0;
-            if (maxHeight <= 0 || h <= maxHeight || v == null) v = f;
-            if (maxHeight > 0 && h >= maxHeight) break;
-          }
-          if (v != null && audio.isNotEmpty) {
-            await _downloadAdaptiveMerge(
-              id: id,
-              videoUrl: v['url'] as String,
-              audioUrl: audio.first['url'] as String,
-              title: title,
-              clientUa: clientUa,
-            );
-            return;
-          }
-          throw Exception(
-              'Este video solo ofrece formatos separados en iOS (elige MP3)');
-        }
-        Map<String, dynamic>? chosen;
-        for (final f in prog) {
-          final h = (f['h'] as num?)?.toInt() ?? 0;
-          if (maxHeight <= 0 || h <= maxHeight || chosen == null) chosen = f;
-          if (maxHeight > 0 && h >= maxHeight) break;
-        }
-        final h = (chosen!['h'] as num?)?.toInt() ?? 0;
-        _emit(EngineEvent(
-            id: id, type: 'progress', progress: 0, message: 'YouTube ${h}p'));
-        await _downloadDirect(id, chosen['url'] as String,
-            title: title, extraHeaders: _ytHeaders(clientUa));
+        await _downloadDirect(id, url,
+            audioOnly: true, title: title, extraHeaders: _ytHeaders(clientUa));
         return;
       }
 
@@ -1010,8 +1041,7 @@ class IosEngine implements DownloadService {
   Future<Map<String, dynamic>> _openVideo(
       String url, Map<String, String> headers) async {
     Future<Map<String, dynamic>> attempt(bool useRange) async {
-      final hc = HttpClient()
-        ..connectionTimeout = const Duration(seconds: 30);
+      final hc = _newHttp();
       final req = await hc.getUrl(Uri.parse(url));
       req.headers.set('User-Agent', ua);
       headers.forEach((k, v) => req.headers.set(k, v));
@@ -1055,7 +1085,13 @@ class IosEngine implements DownloadService {
             .trim();
         if (reason.length > 200) reason = reason.substring(0, 200);
       } catch (_) {}
-      client.close(force: true);
+      // Diagnostico: primera parte de las cabeceras de la respuesta.
+      try {
+        final hdr = resp.headers.toString();
+        // ignore: avoid_print
+        print('[VDC403] status=${resp.statusCode} url=${url.substring(0, url.length.clamp(0, 120))} '
+            'headers=${hdr.substring(0, hdr.length.clamp(0, 400))}');
+      } catch (_) {}      client.close(force: true);
       throw Exception(_httpError(resp.statusCode, url) +
           ' | rango:${usedRange ? "si" : "NO"}' +
           (reason.isEmpty ? '' : ' | MOTIVO: $reason'));
@@ -1353,7 +1389,7 @@ class IosEngine implements DownloadService {
 
   Future<void> _downloadSegment(
       String url, File file, Map<String, String>? headers) async {
-    final client = HttpClient();
+    final client = _newHttp();
     try {
       final req = await client.getUrl(Uri.parse(url));
       req.headers.set('User-Agent', ua);
@@ -1366,7 +1402,7 @@ class IosEngine implements DownloadService {
   }
 
   Future<String> _getText(String url, Map<String, String>? headers) async {
-    final client = HttpClient();
+    final client = _newHttp();
     try {
       final req = await client.getUrl(Uri.parse(url));
       req.headers.set('User-Agent', ua);
