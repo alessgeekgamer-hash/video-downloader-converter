@@ -112,7 +112,8 @@ class IosEngine implements DownloadService {
     };
   }
 
-  /// Mensaje rico para errores HTTP (host, cliente, cookies, ip/expira).
+  /// Mensaje rico para errores HTTP. Requiere _lastIpCache/_lastCookieSent
+  /// llenados justo antes (los llena cada peticion fallida).
   String _httpError(int code, String url) {
     String host;
     try {
@@ -120,19 +121,50 @@ class IosEngine implements DownloadService {
     } catch (_) {
       host = '?';
     }
-    final hasCookie = sessionCookies != null && sessionCookies!.isNotEmpty;
     var extra = '';
-    if (url.contains('&ip=')) {
-      extra = ' | ip=si (atada a la IP que la pidio)';
-    }
+    final mIp = RegExp(r'(?:&|/)ip(?:=|/)([0-9a-fA-F.:]+)').firstMatch(url);
+    if (mIp != null) extra = ' | ip-url:${mIp.group(1)}';
     final mExp = RegExp(r'expire=(\d+)').firstMatch(url);
     if (mExp != null) {
       final exp = int.tryParse(mExp.group(1)!) ?? 0;
       final delta = exp - DateTime.now().millisecondsSinceEpoch ~/ 1000;
       extra += ' | vence en ${Duration(seconds: delta).inMinutes} min';
     }
+    final ipNow = _lastIpCache;
+    if (ipNow.isNotEmpty && ipNow != '?') {
+      if (mIp != null) {
+        extra += mIp.group(1) == ipNow
+            ? ' | ip-actual:$ipNow COINCIDE'
+            : ' | ip-actual:$ipNow **DIFERENTE**';
+      } else {
+        extra += ' | ip-actual:$ipNow';
+      }
+    } else {
+      extra += ' | ip-actual:indisponible';
+    }
+    extra += ' | cookie-env:${_lastCookieSent ? "si" : "NO"}';
     return 'El servidor respondio HTTP $code (host: $host | cliente: '
-        '${_lastClient.isEmpty ? "?" : _lastClient} | cookies: ${hasCookie ? "si" : "NO"}$extra)';
+        '${_lastClient.isEmpty ? "?" : _lastClient}$extra)';
+  }
+
+  String _lastIpCache = '';
+  bool _lastCookieSent = false;
+
+  /// IP publica actual del dispositivo (diagnostico de 403).
+  Future<void> _refreshPublicIp() async {
+    try {
+      final hc = _newHttp(const Duration(seconds: 6));
+      final req = await hc.getUrl(Uri.parse('https://api.ipify.org/'));
+      final resp = await req.close();
+      final txt = await resp
+          .transform(utf8.decoder)
+          .join()
+          .timeout(const Duration(seconds: 6));
+      hc.close(force: true);
+      _lastIpCache = txt.trim();
+    } catch (_) {
+      _lastIpCache = '?';
+    }
   }
 
   final _controller = StreamController<EngineEvent>.broadcast();
@@ -1099,7 +1131,9 @@ class IosEngine implements DownloadService {
         // ignore: avoid_print
         print('[VDC403] status=${resp.statusCode} url=${url.substring(0, url.length.clamp(0, 120))} '
             'headers=${hdr.substring(0, hdr.length.clamp(0, 400))}');
-      } catch (_) {}      client.close(force: true);
+      } catch (_) {}      await _refreshPublicIp();
+      _lastCookieSent = (headers ?? const {}).containsKey('Cookie');
+      client.close(force: true);
       throw Exception(_httpError(resp.statusCode, url) +
           ' | rango:${usedRange ? "si" : "NO"}' +
           (reason.isEmpty ? '' : ' | MOTIVO: $reason'));
@@ -1205,6 +1239,8 @@ class IosEngine implements DownloadService {
             .trim();
         if (reason.length > 200) reason = reason.substring(0, 200);
       } catch (_) {}
+      await _refreshPublicIp();
+      _lastCookieSent = (headers ?? extraHeaders ?? const {}).containsKey('Cookie');
       client.close(force: true);
       _emit(EngineEvent(
           id: id,
