@@ -43,24 +43,32 @@ class IosEngine implements DownloadService {
 
   /// HttpClient con IPv4 FORZADO: el ip= del player debe coincidir con el
   /// de la descarga siempre (los carriers moviles rotan IPv4/IPv6).
-  HttpClient _newHttp([Duration? timeout]) {
+  /// HttpClient con IPv4 opcional. DESACTIVADO por defecto: en varias redes
+  /// (incluida la de pruebas) el forzadoIPv4 cierra la conexion. La
+  /// rotacion de IP se cubre con los reintentos de URL fresca.
+  HttpClient _newHttp([Duration? timeout, bool pinIpv4 = false]) {
     final hc = HttpClient()
       ..connectionTimeout = timeout ?? const Duration(seconds: 30);
+    if (!pinIpv4) return hc;
     try {
-      hc.connectionFactory = (uri, host, port) async {
+      // OJO: los parametros del factory son (url, proxyHost, proxyPort) —
+      // host/puerto REALES vienen en la Uri. Ignorar proxy (no usamos).
+      hc.connectionFactory = (uri, proxyHost, proxyPort) async {
+        final realHost = uri.host;
+        final realPort = uri.port;
         Future<Socket> future;
         try {
           // Forzar IPv4: si el carrier usa IPv6 para una peticion y IPv4
           // para otra, el ip= embebido no coincide y googlevideo da403.
-          final addrs = await InternetAddress.lookup(host!,
+          final addrs = await InternetAddress.lookup(realHost,
               type: InternetAddressType.IPv4);
           future = addrs.isEmpty
-              ? Socket.connect(host, port!,
+              ? Socket.connect(realHost, realPort,
                   timeout: const Duration(seconds: 30))
-              : Socket.connect(addrs.first, port!,
+              : Socket.connect(addrs.first, realPort,
                   timeout: const Duration(seconds: 30));
         } catch (_) {
-          future = Socket.connect(host, port!,
+          future = Socket.connect(realHost, realPort,
               timeout: const Duration(seconds: 30));
         }
         return ConnectionTask.fromSocket(future, () {
