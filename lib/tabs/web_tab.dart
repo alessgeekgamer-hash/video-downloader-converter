@@ -390,7 +390,9 @@ class _WebTabState extends State<WebTab> with AutomaticKeepAliveClientMixin {
                 onLoadResource: Platform.isIOS
                     ? (c, resource) {
                         final u = resource.url?.toString() ?? '';
-                        if (u.contains('.m3u8')) {
+                        if (u.contains('.m3u8') ||
+                            (u.contains('googlevideo.com') &&
+                                u.contains('videoplayback'))) {
                           _lastStreamUrl = u;
                           _lastStreamPage = _currentUrl;
                         }

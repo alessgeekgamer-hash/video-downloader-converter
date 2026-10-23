@@ -285,7 +285,8 @@ class IosEngine implements DownloadService {
 
       // ---- YouTube: player response del sitio (URLs progresivas con audio)
       if (pageUrl.contains('youtube.com') || pageUrl.contains('youtu.be')) {
-        await _youtubeFromPage(id, controller, audioOnly, maxHeight);
+        await _youtubeFromPage(id, controller, audioOnly, maxHeight,
+            extraLive: fallbackStreamUrl);
         return;
       }
 
@@ -326,8 +327,12 @@ class IosEngine implements DownloadService {
   }
 
   Future<void> _youtubeFromPage(String id, InAppWebViewController controller,
-      bool audioOnly, int maxHeight) async {
+      bool audioOnly, int maxHeight, {String? extraLive}) async {
     var data = await extractFromPage(controller);
+    if (extraLive != null && extraLive.isNotEmpty && data['liveUrl'] == null) {
+      data['liveUrl'] = extraLive;
+      data['diag'] = '|live:capturado';
+    }
     if ((data['kind'] as String?) == 'none') {
       _emit(EngineEvent(
           id: id,
@@ -337,8 +342,8 @@ class IosEngine implements DownloadService {
       return;
     }
 
-    // Reintento anti-403: en carriers moviles la IP puede rotar entre el
-    // player y la descarga; se pide una URL fresca y reintenta (3 veces).
+    // Reintento anti-403 y, si persiste (PO Token en videos musicales),
+    // usar la URL del REPRODUCTOR real (ya resolvio el token).
     Object? lastError;
     for (var attempt = 0; attempt < 3; attempt++) {
       if (attempt > 0) {
@@ -346,8 +351,7 @@ class IosEngine implements DownloadService {
             id: id,
             type: 'progress',
             progress: 0,
-            message: 'Reintento ${attempt + 1}/3 (IP cambio)'));
-        await Future.delayed(const Duration(seconds: 2));
+            message: 'Reintento ${attempt + 1}/3'));
         final fresh = await extractFromPage(controller);
         if ((fresh['kind'] as String?) == 'none') break;
         data = fresh;
@@ -360,10 +364,57 @@ class IosEngine implements DownloadService {
         if (!e.toString().contains('403')) break;
       }
     }
+    // PO Token: 403 vacio en videos musicales. Ultimo recurso: la URL
+    // del REPRODUCTOR real (el sitio ya resolvio el token).
+    final live = (data['liveUrl'] as String?) ?? '';
+    if (live.isNotEmpty && (lastError?.toString().contains('403') ?? false)) {
+      if (audioOnly && _looksVideoOnly(live)) {
+        _emit(EngineEvent(
+            id: id,
+            type: 'error',
+            message:
+                'PO Token: el reproductor solo ofrecio video sin audio. Usa MP4 o prueba otro video. ${data['diag'] ?? ''}'));
+        return;
+      }
+      _emit(EngineEvent(
+          id: id,
+          type: 'progress',
+          progress: 0,
+          message: 'Usando stream del reproductor (PO Token)'));
+      try {
+        await _downloadDirect(id, live,
+            title: data['title'] as String?,
+            audioOnly: audioOnly,
+            headers: {
+              'User-Agent': ua,
+              'Referer': 'https://www.youtube.com/',
+              if (sessionCookies != null && sessionCookies!.isNotEmpty)
+                'Cookie': sessionCookies!,
+            });
+        return;
+      } catch (e) {
+        lastError = e;
+      }
+    }
     _emit(EngineEvent(
         id: id,
         type: 'error',
-        message: 'Falló tras reintentos: ${lastError ?? "error desconocido"}'));
+        message:
+            'Fallo tras reintentos: ${lastError ?? "error desconocido"}${live.isEmpty ? ' | live:vacio' : ' | live:si'}'));
+  }
+
+  /// itags de SOLO VIDEO (adaptativos sin audio) de YouTube.
+  bool _looksVideoOnly(String url) {
+    final m = RegExp(r'[?&]itag=(\d+)').firstMatch(url);
+    if (m == null) return false;
+    final itag = int.tryParse(m.group(1)!) ?? 0;
+    if (itag == 18 || itag == 22 || itag == 37) return false;
+    return (itag >= 133 && itag <= 139) ||
+        itag == 160 ||
+        (itag >= 244 && itag <= 264) ||
+        (itag >= 298 && itag <= 299) ||
+        (itag >= 302 && itag <= 317) ||
+        (itag >= 330 && itag <= 337);
   }
 
   /// Un intento de descarga de YouTube (usado tambien por Universal).
@@ -538,6 +589,26 @@ class IosEngine implements DownloadService {
       } catch (_) {}
     }
 
+    // Fase4 (siempre en YouTube): capturar la URL del REPRODUCTOR real,
+    // que ya resolvio el PO Token internamente (los videos musicales
+    // exigen pot y las URLs directas dan 403 vacio).
+    if (videoId.isNotEmpty) {
+      try {
+        await controller.evaluateJavascript(source: _autoplayJs);
+        await Future.delayed(const Duration(seconds: 4));
+        final src = await controller.evaluateJavascript(source: _readSrcJs);
+        final s = (src is String) ? src.trim() : '';
+        if (s.startsWith('http') &&
+            (s.contains('googlevideo.com') || s.contains('.m3u8'))) {
+          data['liveUrl'] = s;
+          data['diag'] = '${data['diag'] ?? ''}|live:si';
+        } else {
+          data['diag'] = '${data['diag'] ?? ''}|live:vacio';
+        }
+      } catch (e) {
+        data['diag'] = '${data['diag'] ?? ''}|live:ex';
+      }
+    }
     // Normalizar listas.
     data['progressive'] = ((data['progressive'] as List?) ?? const [])
         .map((e) => Map<String, dynamic>.from(e as Map))
@@ -922,6 +993,7 @@ class IosEngine implements DownloadService {
         'audio': audio,
         'adaptiveVideo': (d['adaptiveVideo'] as List? ?? const []),
         'client': (d['client'] as String?) ?? 'WEB',
+        'liveUrl': d['liveUrl'],
         'page_url': 'https://www.youtube.com/',
       };
     }
@@ -958,38 +1030,13 @@ class IosEngine implements DownloadService {
         kind0 == 'youtube-audio' ||
         kind0 == 'youtube-hls';
 
-    // YouTube: misma logica de reintentos anti-403 (URL fresca si la IP
-    // del carrier rota entre player y descarga).
+    // YouTube: reutiliza toda la logica de la pestaña YouTube (reintentos
+    // + fallback PO Token desde el reproductor real de la pagina).
     if (isYoutube && controller != null) {
       _canceled[id] = false;
       _emit(EngineEvent(id: id, type: 'start'));
-      Object? lastError;
-      var data = info;
-      for (var attempt = 0; attempt < 3; attempt++) {
-        if (attempt > 0) {
-          _emit(EngineEvent(
-              id: id,
-              type: 'progress',
-              progress: 0,
-              message: 'Reintento ${attempt + 1}/3 (IP cambio)'));
-          await Future.delayed(const Duration(seconds: 2));
-          final fresh = await extractFromPage(controller);
-          if ((fresh['kind'] as String?) == 'none') break;
-          data = fresh;
-        }
-        try {
-          await _ytDownloadStep(id, data, audioOnly, maxHeight);
-          return;
-        } catch (e) {
-          lastError = e;
-          if (!e.toString().contains('403')) break;
-        }
-      }
-      _emit(EngineEvent(
-          id: id,
-          type: 'error',
-          message:
-              'Fallo tras reintentos: ${lastError ?? "error desconocido"}'));
+      await _youtubeFromPage(id, controller, audioOnly, maxHeight,
+            extraLive: info['liveUrl'] as String?);
       return;
     }
 
