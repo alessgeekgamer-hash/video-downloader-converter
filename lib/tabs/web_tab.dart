@@ -1,3 +1,4 @@
+import 'dart:collection';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -362,6 +363,16 @@ class _WebTabState extends State<WebTab> with AutomaticKeepAliveClientMixin {
                   },
                 ),
                 initialSettings: settings,
+                // Gancho PO Token: captura la respuesta del reproductor
+                // de la pagina (musica VEVO).
+                initialUserScripts: Platform.isIOS
+                    ? UnmodifiableListView([
+                        UserScript(
+                            source: IosEngine.pageHookScript,
+                            injectionTime:
+                                UserScriptInjectionTime.AT_DOCUMENT_START)
+                    ])
+                    : null,
                 pullToRefreshController: _pullToRefresh,
                 onWebViewCreated: (c) {
                   _controller = c;

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -194,6 +195,12 @@ class _ExtractTabState extends State<ExtractTab>
                 useShouldOverrideUrlLoading: false,
                 clearCache: false,
               ),
+              initialUserScripts: UnmodifiableListView([
+                UserScript(
+                    source: IosEngine.pageHookScript,
+                    injectionTime:
+                        UserScriptInjectionTime.AT_DOCUMENT_START),
+              ]),
               onWebViewCreated: (c) => _hidden = c,
               onLoadStop: (c, url) async {
                 if (!_pendingAnalysis) return;

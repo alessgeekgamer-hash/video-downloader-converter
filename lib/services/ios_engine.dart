@@ -78,6 +78,46 @@ class IosEngine implements DownloadService {
     } catch (_) {}
     return hc;
   }
+  /// Gancho inyectado al INICIO del documento: captura las respuestas del
+  /// reproductor de YouTube (youtubei/v1/player) que YA resolvieron el
+  /// PO Token dentro de la pagina (musica VEVO).
+  static const pageHookScript = r'''
+(() => {
+  try {
+    window.__vdcPlayers = [];
+    const origFetch = window.fetch;
+    window.fetch = function() {
+      const req = arguments[0];
+      const url = typeof req === "string" ? req : (req && req.url ? req.url : "");
+      const p = origFetch.apply(this, arguments);
+      if (url.indexOf("youtubei/v1/player") >= 0) {
+        p.then(r => r.clone().json()).then(j => {
+          try {
+            window.__vdcPlayers.push(JSON.stringify(j));
+            if (window.__vdcPlayers.length > 3) window.__vdcPlayers.shift();
+          } catch (e) {}
+        }).catch(() => {});
+      }
+      return p;
+    };
+    const origOpen = XMLHttpRequest.prototype.open;
+    const origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(m, u) {
+      this.__vdcUrl = u;
+      return origOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function() {
+      const self = this;
+      if (self.__vdcUrl && self.__vdcUrl.indexOf("youtubei/v1/player") >= 0) {
+        self.addEventListener("load", () => {
+          try { window.__vdcPlayers.push(self.responseText); } catch (e) {}
+        });
+      }
+      return origSend.apply(this, arguments);
+    };
+  } catch (e) {}
+})();
+''';
   /// Ultimo cliente InnerTube usado (para diagnosticos de error).
   String _lastClient = '';
 
@@ -514,8 +554,33 @@ class IosEngine implements DownloadService {
       data['diag'] = '${data['diag'] ?? ''}|web-descartado:${data['kind']}';
       data['kind'] = 'none';
     }
-    if (videoId.isNotEmpty) {
-      final clients = <Map<String, dynamic>>[
+    // Fase2b: respuesta del REPRODUCTOR de la pagina (capturada por
+    // pageHookScript) - YA resolvio el PO Token (musica VEVO).
+    if (videoId.isNotEmpty && data['kind'] == 'none') {
+      try {
+        final raw = await controller.evaluateJavascript(
+            source: "(()=>{const a=window.__vdcPlayers;"
+                "return (a && a.length) ? a[a.length - 1] : null;})()");
+        final s = (raw is String) ? raw.trim() : '';
+        if (s.isNotEmpty && s != 'null') {
+          final mapped =
+              _mapPlayerJson(jsonDecode(s) as Map<String, dynamic>);
+          mapped['client'] = 'WEB-POT';
+          if (mapped['kind'] != 'none') {
+            data = {...data, ...mapped};
+            data['diag'] = '${data['diag'] ?? ''}|pagina-pot';
+          } else {
+            data['diag'] =
+                '${data['diag'] ?? ''}|pot:{${mapped['diag'] ?? ''}}';
+          }
+        } else {
+          data['diag'] = '${data['diag'] ?? ''}|pot:vacio';
+        }
+      } catch (_) {
+        data['diag'] = '${data['diag'] ?? ''}|pot:ex';
+      }
+    }
+    if (videoId.isNotEmpty && data['kind'] == 'none') {      final clients = <Map<String, dynamic>>[
         {
           'clientName': 'IOS',
           'clientVersion': '20.10.38',
@@ -592,15 +657,22 @@ class IosEngine implements DownloadService {
     // Fase4 (siempre en YouTube): capturar la URL del REPRODUCTOR real,
     // que ya resolvio el PO Token internamente (los videos musicales
     // exigen pot y las URLs directas dan 403 vacio).
-    if (videoId.isNotEmpty) {
+    if (videoId.isNotEmpty && data['kind'] == 'none') {
       try {
         await controller.evaluateJavascript(source: _autoplayJs);
-        await Future.delayed(const Duration(seconds: 4));
-        final src = await controller.evaluateJavascript(source: _readSrcJs);
-        final s = (src is String) ? src.trim() : '';
-        if (s.startsWith('http') &&
-            (s.contains('googlevideo.com') || s.contains('.m3u8'))) {
-          data['liveUrl'] = s;
+        var live = '';
+        for (var i = 0; i < 10; i++) {
+          await Future.delayed(const Duration(seconds: 1));
+          final src = await controller.evaluateJavascript(source: _readSrcJs);
+          final t = (src is String) ? src.trim() : '';
+          if (t.startsWith('http') &&
+              (t.contains('googlevideo.com') || t.contains('.m3u8'))) {
+            live = t;
+            break;
+          }
+        }
+        if (live.isNotEmpty) {
+          data['liveUrl'] = live;
           data['diag'] = '${data['diag'] ?? ''}|live:si';
         } else {
           data['diag'] = '${data['diag'] ?? ''}|live:vacio';
@@ -761,15 +833,18 @@ class IosEngine implements DownloadService {
     }
   }
 
-  static const _autoplayJs = r'''
-(() => {
+  static const _autoplayJs = r'''(() => {
   const v = document.querySelector("video");
   if (!v) return "novideo";
   try { v.muted = true; v.defaultMuted = true; v.volume = 0; } catch(e){}
+  try {
+    const b = document.querySelector(".ytp-large-play-button, .ytp-cued-thumbnail-overlay, ytd-play-button");
+    if (b && b.click) b.click();
+  } catch(e){}
+  try { if (v.click) v.click(); } catch(e){}
   try { const pr = v.play(); if (pr && pr.catch) pr.catch(() => {}); } catch(e){}
   return "ok";
-})()
-''';
+})()''';
 
   static const _readSrcJs =
       r'(()=>{const v=document.querySelector("video");return v ? (v.currentSrc || v.src || "") : "";})()';
